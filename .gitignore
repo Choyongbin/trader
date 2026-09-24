@@ -1,0 +1,29 @@
+﻿# Binance credentials - NEVER COMMIT
+config/binance_credentials.enc
+
+# Large datasets / generated artifacts
+data/
+history/
+history_external/
+*.parquet
+*.zip
+
+# Temporary Go/build caches
+.tmp_*/
+
+# Build outputs
+*.exe
+*.dll
+
+# Logs
+*.log
+
+# Local secrets and private keys
+.env
+.env.*
+*.pem
+*.key
+
+# Windows
+Thumbs.db
+Desktop.ini

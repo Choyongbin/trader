@@ -1,0 +1,42 @@
+{
+  "policy_version": 1,
+  "symbol": "BTCUSDT",
+  "source": {
+    "logistic_version": 1,
+    "calibration_version": 1,
+    "long_logistic_sha256": "dfdd0d9e5421ead4fa6b68a7108dfbbaae60aa577025a3bc9703f7aff62f9430",
+    "short_logistic_sha256": "a6c3612af44900f8e1a1682eeae315e15619d57237271023ca468c9de0b9f6b0",
+    "long_calibration_sha256": "71556dc68c81791a684df67896e9c917d0b2d4c1d2c717407d3713f7a58403b6",
+    "short_calibration_sha256": "17c75bb8f422148a913e4810449d53db77fe374389da4b1caeb41c498c119fdb"
+  },
+  "split_version": 1,
+  "policy_selection_range": {
+    "start_ms": 1735689600000,
+    "end_ms": 1743465600000
+  },
+  "policy_confirmation_range": {
+    "start_ms": 1743465600000,
+    "end_ms": 1751328000000
+  },
+  "max_label_dependency_ms": 3602000,
+  "embargo_ms": 0,
+  "purge_rule": "exclude selection row when decision_timestamp_ms + max_label_dependency_ms \u003e= policy_confirmation_start_ms",
+  "candidate_coverages": [
+    0.5,
+    0.25,
+    0.1,
+    0.05,
+    0.02,
+    0.01,
+    0.005
+  ],
+  "min_valid_signal_count": 5000,
+  "min_active_days": 30,
+  "long": {
+    "enabled": false
+  },
+  "short": {
+    "enabled": false
+  },
+  "conflict_rule": "qualify with p \u003e= threshold; if both qualify choose larger probability-minus-threshold margin; exact margin tie is NO_TRADE; disabled sides never qualify"
+}

@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="BTCUSDT automated trading operations console">
+  <title>BTCUSDT Trading Console</title>
+  <link rel="stylesheet" href="/app.css">
+  <style>#page-assets .wide{grid-column:1/-1}#page-assets table{min-width:700px}#page-assets .metric strong{font-size:17px}#entryBlockers{margin-top:12px;min-height:48px}@media(max-width:720px){.sidebar nav{grid-template-columns:repeat(5,1fr)}#page-assets .wide{grid-column:auto}}</style>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">B</span><div><strong>BTCUSDT</strong><small>AUTO TRADER</small></div></div>
+      <div class="header-center">
+        <div class="environment-switch" role="group" aria-label="Execution environment">
+          <button class="env-button active" data-env="TESTNET">BINANCE DEMO</button>
+          <button class="env-button danger" data-env="MAINNET">MAINNET</button>
+        </div>
+        <span id="environmentBadge" class="badge test">TEST MODE · VIRTUAL FUNDS</span>
+      </div>
+      <div class="ticker"><span>BTC FUTURES</span><strong id="headerPrice">—</strong><i id="connectionDot"></i><em id="connectionText">CONNECTING</em></div>
+    </header>
+
+    <aside class="sidebar">
+      <nav>
+        <button class="nav-item active" data-page="dashboard"><span>⌁</span>Dashboard</button>
+        <button class="nav-item" data-page="assets"><span>◈</span>Assets</button>
+        <button class="nav-item" data-page="trading"><span>↗</span>Trading</button>
+        <button class="nav-item" data-page="orders"><span>≡</span>Orders</button>
+        <button class="nav-item" data-page="system"><span>◉</span>System</button>
+      </nav>
+      <div class="sidebar-foot"><span class="mode-dot"></span><div><strong>PAPER VALIDATION</strong><small>Live orders locked</small></div></div>
+    </aside>
+
+    <main>
+      <section class="page active" id="page-dashboard">
+        <div class="page-title"><div><p>OPERATIONS OVERVIEW</p><h1>Dashboard</h1></div><span id="updatedAt">Awaiting market data</span></div>
+        <div class="metric-grid">
+          <article class="metric primary"><span>Futures Price</span><strong id="futuresPrice">—</strong><small>BTCUSDT PERPETUAL</small></article>
+          <article class="metric"><span>Spot Price</span><strong id="spotPrice">—</strong><small>BTCUSDT SPOT</small></article>
+          <article class="metric"><span>Mark Price</span><strong id="markPrice">—</strong><small id="premiumValue">Premium —</small></article>
+          <article class="metric"><span>Auto Trading</span><strong id="autoStatus">STOPPED</strong><small id="signalValue">Signal · NOT_READY</small></article>
+        </div>
+        <div class="dashboard-grid">
+          <article class="panel balance-panel">
+            <div class="panel-head"><div><span>FUTURES ACCOUNT</span><h2>Wallet</h2></div><span id="accountState" class="status muted">NOT CONNECTED</span></div>
+            <div class="balance-total"><span>Wallet Balance</span><strong id="walletBalance">ACCOUNT NOT CONNECTED</strong></div>
+            <div class="stat-list"><div><span>Available</span><b id="availableBalance">—</b></div><div><span>Margin Balance</span><b id="marginBalance">—</b></div><div><span>Used Margin</span><b id="usedMargin">—</b></div><div><span>Unrealized PnL</span><b id="unrealizedPnl">—</b></div></div>
+          </article>
+          <article class="panel position-panel">
+            <div class="panel-head"><div><span>EXPOSURE</span><h2>Current Position</h2></div><button id="closePosition" class="ghost danger-text" disabled>Close</button></div>
+            <div id="positionEmpty" class="empty-state"><div class="empty-icon">◇</div><strong>NO OPEN POSITION</strong><span>The system is flat in this environment.</span></div>
+            <div id="positionDetail" class="position-detail hidden"></div>
+          </article>
+          <article class="panel model-panel">
+            <div class="panel-head"><div><span>STRATEGY</span><h2>Production Model</h2></div><span class="status ok">FROZEN</span></div>
+            <strong class="model-name">BTC Feature V2 Production V1</strong><div class="model-meta"><span>128 FEATURES</span><span>5 CANDIDATES</span><span>LOGISTIC_LINEAR</span></div>
+            <div class="hash-row"><span>Feature</span><code>a37306b8…3045bef</code></div><div class="hash-row"><span>Entry</span><code>4fae120d…d3dd31</code></div><div class="hash-row"><span>Risk</span><code>21e3332b…96f7</code></div>
+          </article>
+          <article class="panel warmup-panel">
+            <div class="panel-head"><div><span>FEATURE ENGINE</span><h2>Warmup</h2></div><span id="warmupStatus" class="status warning">WARMING UP</span></div>
+            <div class="progress-copy"><strong id="warmupTime">00:00:00 / 04:00:00</strong><span id="warmupPercent">0%</span></div><div class="progress"><i id="warmupBar"></i></div>
+            <p id="warmupExplanation">Previous contiguous capture is separate from current live readiness.</p>
+            <div class="stat-list"><div><span>Missing</span><b id="warmupMissing">04:00:00</b></div><div><span>Spot Assets</span><b id="dashboardSpotStatus">UNAVAILABLE</b></div></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="page" id="page-assets">
+        <div class="page-title"><div><p>PORTFOLIO</p><h1>Assets</h1></div><span id="portfolioEnvironment">BINANCE DEMO</span></div>
+        <div class="metric-grid"><article class="metric primary"><span>Total Account Value</span><strong id="portfolioTotal">TOTAL VALUE UNAVAILABLE</strong><small id="portfolioStatus">PARTIAL</small></article><article class="metric"><span>Spot Account</span><strong id="spotStatus">UNAVAILABLE</strong><small>Separate credentials may be required</small></article><article class="metric"><span>Futures Account</span><strong id="futuresStatus">NOT CONNECTED</strong><small>Futures wallet and position are separate</small></article></div>
+        <div class="dashboard-grid">
+          <article class="panel"><div class="panel-head"><div><span>SPOT ASSETS</span><h2>Coin Holdings</h2></div><label class="check"><input id="showZeroAssets" type="checkbox">Show zero balances</label></div><div class="table-wrap"><table><thead><tr><th>Asset</th><th>Free</th><th>Locked</th><th>Total</th><th>USDT Value</th></tr></thead><tbody id="spotAssetsBody"><tr><td colspan="5">SPOT ACCOUNT NOT AVAILABLE</td></tr></tbody></table></div></article>
+          <article class="panel"><div class="panel-head"><div><span>FUTURES ACCOUNT</span><h2>Wallet</h2></div></div><div id="futuresWallet" class="stat-list">NOT CONNECTED</div></article>
+          <article class="panel wide"><div class="panel-head"><div><span>FUTURES POSITIONS</span><h2>Open Exposure</h2></div></div><div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Side</th><th>Quantity</th><th>Notional</th><th>Entry</th><th>Mark</th><th>PnL</th><th>ROE</th><th>Leverage</th><th>Margin</th><th>Liquidation</th></tr></thead><tbody id="futuresPositionsBody"><tr><td colspan="11">NO OPEN FUTURES POSITION</td></tr></tbody></table></div></article>
+        </div>
+      </section>
+
+      <section class="page" id="page-trading">
+        <div class="page-title"><div><p>EXECUTION CONTROL</p><h1>Trading</h1></div><span class="safety-note">All actions are backend-gated</span></div>
+        <div class="trading-grid">
+          <article class="panel auto-panel">
+            <div class="panel-head"><div><span>AUTOMATION</span><h2>Auto Trading</h2></div><span id="autoPanelStatus" class="status muted">STOPPED</span></div>
+            <label>Model Profile<select id="modelSelect"><option value="btc-feature-v2-production-v1">BTC Feature V2 Production V1</option></select></label>
+            <div class="signal-card"><span>CURRENT SIGNAL</span><strong id="currentSignal">NOT_READY</strong><small>Waiting for an eligible frozen-policy decision</small></div>
+            <div id="candidateScores" class="logs">No eligible live decision.</div>
+            <div id="proposedTrade" class="logs">No proposed trade.</div>
+            <div class="gate-list"><div><span>Market Public Data</span><b id="gateMarket">CONNECTING</b></div><div><span>Feature Warmup</span><b id="gateWarmup">WARMING UP</b></div><div><span>Feature Registry / Model / Policies</span><b>READY</b></div><div><span>Credentials</span><b id="gateCredentials">MISSING</b></div><div><span>Testnet Account</span><b id="gateAccount">NOT CONNECTED</b></div><div><span>Testnet Broker</span><b id="gateBroker">NOT READY</b></div><div><span>Position</span><b id="gatePosition">FLAT</b></div><div><span>Orders Enabled</span><b id="gateOrders">NO</b></div><div><span>Overall</span><b id="gateOverall">BLOCKED · FEATURE_WARMUP</b></div></div>
+            <div id="entryBlockers" class="logs">FEATURE_WARMUP</div>
+            <div id="killSwitchState" class="logs">Kill switch: INACTIVE</div>
+            <div class="button-row"><button id="startAuto" class="button primary">START AUTO TRADING</button><button id="stopAuto" class="button secondary">STOP NEW TRADES</button></div>
+            <button id="emergencyStop" class="button emergency">EMERGENCY STOP · CANCEL PENDING ENTRY</button>
+            <p class="hint">Existing TP/SL risk management remains active after STOP NEW TRADES.</p>
+          </article>
+
+          <article class="panel manual-panel">
+            <div class="panel-head"><div><span>DISCRETIONARY</span><h2>Manual Order</h2></div><span class="status warning">MARKET</span></div>
+            <div class="side-toggle"><button class="active long" data-side="LONG">LONG</button><button class="short" data-side="SHORT">SHORT</button></div>
+            <div class="form-grid"><label>Margin Amount <div class="input-unit"><input id="marginAmount" type="number" min="1" step="1" value="100"><span>USDT</span></div></label><label>Leverage <div class="stepper"><button id="leverageDown">−</button><input id="leverage" type="number" min="1" max="125" value="5"><button id="leverageUp">+</button></div></label></div>
+            <div class="estimate"><div><span>Expected Notional</span><strong id="estimatedNotional">500.00 USDT</strong></div><div><span>Estimated Quantity</span><strong id="estimatedQuantity">— BTC</strong></div></div>
+            <div class="protective-grid"><div class="protective"><label class="check"><input id="tpEnabled" type="checkbox" checked><span>Take Profit</span></label><div class="input-unit"><input id="tpValue" type="number" step="0.05" value="0.75"><span>%</span></div><small id="tpEstimate">Estimated price —</small></div><div class="protective"><label class="check"><input id="slEnabled" type="checkbox" checked><span>Stop Loss</span></label><div class="input-unit"><input id="slValue" type="number" step="0.05" value="0.50"><span>%</span></div><small id="slEstimate">Estimated price —</small></div></div>
+            <button id="reviewOrder" class="button trade">REVIEW LONG ORDER</button><p class="hint">V1 uses Margin Amount (USDT). Quantity is normalized by the backend.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="page" id="page-orders">
+        <div class="page-title"><div><p>EXECUTION LEDGER</p><h1>Orders</h1></div><span id="orderEnvironment">TESTNET</span></div>
+        <article class="panel table-panel"><div class="tabs"><button class="active">Open & Recent Orders</button><button disabled>Trade / Fill History</button></div><div class="table-wrap"><table><thead><tr><th>Time</th><th>Environment</th><th>Symbol</th><th>Side</th><th>Order Type</th><th>Quantity</th><th>Price</th><th>Status</th><th>clientOrderID</th></tr></thead><tbody id="ordersBody"><tr><td colspan="9" class="table-empty">NO ORDERS IN THIS ENVIRONMENT</td></tr></tbody></table></div></article>
+      </section>
+
+      <section class="page" id="page-system">
+        <div class="page-title"><div><p>OBSERVABILITY</p><h1>System</h1></div><button id="reloadCredentials" class="button secondary compact">RELOAD CREDENTIAL FILE</button></div>
+        <div class="system-grid">
+          <article class="panel"><div class="panel-head"><div><span>CONNECTIVITY</span><h2>Connections</h2></div></div><div id="connectionList" class="health-list"></div></article>
+          <article class="panel"><div class="panel-head"><div><span>SECRETS</span><h2>Credential Status</h2></div></div><div id="credentialList" class="health-list"></div><p class="hint">Values are never returned to the browser. Reload may require restart for an active session.</p></article>
+          <article class="panel wide"><div class="panel-head"><div><span>DATA SOURCES</span><h2>Feature Health</h2></div></div><div id="sourceGrid" class="source-grid"></div></article>
+          <article class="panel wide"><div class="panel-head"><div><span>LIVE FEATURE READINESS</span><h2>Warmup</h2></div></div><div id="systemWarmup" class="logs">NOT READY</div></article>
+          <article class="panel wide"><div class="panel-head"><div><span>OPERATIONAL TELEMETRY</span><h2>Counters</h2></div></div><div id="systemTelemetry" class="logs">Loading</div></article>
+          <article class="panel wide"><div class="panel-head"><div><span>ENTRY SAFETY</span><h2>Active Blockers</h2></div></div><div id="systemBlockers" class="logs">Loading</div></article>
+          <article class="panel wide"><div class="panel-head"><div><span>LATENCY</span><h2>Observed Samples</h2></div></div><div id="systemLatency" class="logs">UNAVAILABLE</div></article>
+          <article class="panel wide"><div class="panel-head"><div><span>AUDIT TRAIL</span><h2>Recent Logs & Warnings</h2></div></div><div id="logs" class="logs">No operational events.</div></article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="confirmationDialog">
+    <form method="dialog" class="modal"><div class="modal-top"><span id="modalEnvironment" class="badge test">TESTNET ORDER</span><button value="cancel" aria-label="Close">×</button></div><h2 id="modalTitle">Review LONG order</h2><p id="modalWarning">Binance Testnet / Demo virtual funds</p><div id="modalSummary" class="summary"></div><label id="liveConfirmWrap" class="hidden">Type <b>CONFIRM LIVE ORDER</b><input id="liveConfirmation" autocomplete="off"></label><div class="button-row"><button value="cancel" class="button secondary">CANCEL</button><button id="confirmOrder" value="default" class="button trade">CONFIRM ORDER</button></div></form>
+  </dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
