@@ -2,6 +2,8 @@ package uiapi
 
 import (
 	"net/http"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -24,12 +26,19 @@ func (s *Server) entryBlockers(environment TradingEnvironment) []EntryBlocker {
 	market := s.market
 	futuresAt, spotAt, markAt := s.marketSourceUpdated["futures"], s.marketSourceUpdated["spot"], s.marketSourceUpdated["mark"]
 	brokerReady := s.testnet != nil
+	recoveryBlocked := s.autoRecoveryBlocked
 	s.mu.RUnlock()
 	now := s.now().UTC()
 	add := func(rows []EntryBlocker, code, description string) []EntryBlocker {
 		return append(rows, EntryBlocker{Code: code, Description: description, Active: true})
 	}
 	var rows []EntryBlocker
+	if environment == TradingEnvironmentTestnet && !strings.EqualFold(strings.TrimSpace(os.Getenv("BINANCE_ENV")), "TESTNET") {
+		rows = add(rows, "PROCESS_ENV_NOT_TESTNET", "Process environment is not TESTNET")
+	}
+	if environment == TradingEnvironmentTestnet && recoveryBlocked {
+		rows = add(rows, "UNKNOWN_EXECUTION_STATE", "Persisted automatic execution state requires reconciliation")
+	}
 	if environment != TradingEnvironmentTestnet {
 		rows = add(rows, "BROKER_UNAVAILABLE", "Mainnet execution is disabled")
 	}

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -11,6 +12,25 @@ import (
 	"binance_trader/internal/live/runtimefeature"
 	"binance_trader/internal/market"
 )
+
+func TestDurationContract(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		duration time.Duration
+		wantErr  bool
+	}{{"indefinite", 0, false}, {"bounded", time.Second, false}, {"negative", -time.Second, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := validateOptions(Options{Duration: tc.duration, SnapshotPath: "snapshot.json"}); (got != nil) != tc.wantErr {
+				t.Fatalf("validateOptions error=%v wantErr=%t", got, tc.wantErr)
+			}
+		})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := Run(ctx, Options{Duration: 0, SnapshotPath: filepath.Join(t.TempDir(), "snapshot.json")}); err != nil {
+		t.Fatalf("normal parent cancellation returned an error: %v", err)
+	}
+}
 
 func TestLastAggTradeIDSkipsTrailingNoTradeBars(t *testing.T) {
 	rows := []market.SecondBar{{LastAggTradeID: 41}, {LastAggTradeID: 42}, {LastAggTradeID: 0}, {LastAggTradeID: 0}}

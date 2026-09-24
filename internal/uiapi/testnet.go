@@ -32,6 +32,10 @@ type AutoTestnetBackend interface {
 	CleanupAutoProtective(context.Context, []string) error
 }
 
+type AutoPositionCloser interface {
+	CloseAutoPosition(context.Context, string, []string, string, float64) (binance.Order, error)
+}
+
 type BinanceTestnetBackend struct {
 	client *binance.Client
 	broker *binance.BinanceTestnetBroker
@@ -646,6 +650,46 @@ func (b *BinanceTestnetBackend) ClosePosition(ctx context.Context, requestID str
 	_, finalPositions, finalOrders, err := b.Refresh(ctx)
 	if err != nil || len(finalPositions) != 0 || len(finalOrders) != 0 {
 		return closed, fmt.Errorf("final exchange state is not flat and clean")
+	}
+	return closed, nil
+}
+
+// CloseAutoPosition closes the exchange position but cancels only protective
+// algo orders owned by the automatic entry. Unrelated/manual orders remain.
+func (b *BinanceTestnetBackend) CloseAutoPosition(ctx context.Context, requestID string, protectiveIDs []string, expectedSide string, expectedQuantity float64) (binance.Order, error) {
+	_, positions, _, err := b.Refresh(ctx)
+	if err != nil {
+		return binance.Order{}, err
+	}
+	if len(positions) != 1 {
+		return binance.Order{}, fmt.Errorf("exactly one auto position required")
+	}
+	p := positions[0]
+	if p.Side != expectedSide || expectedQuantity <= 0 || math.Abs(p.QuantityBTC-expectedQuantity) > 1e-12 {
+		return binance.Order{}, fmt.Errorf("auto position ownership mismatch")
+	}
+	side := "SELL"
+	if p.Side == "SHORT" {
+		side = "BUY"
+	}
+	symbol, _, err := b.client.ExchangeSymbol(ctx, p.Symbol)
+	if err != nil {
+		return binance.Order{}, err
+	}
+	quantityText, err := binance.FormatQuantity(symbol, p.QuantityBTC, true)
+	if err != nil {
+		return binance.Order{}, err
+	}
+	closed, err := b.broker.ReduceOnlyMarketExit(ctx, p.Symbol, side, quantityText, requestID)
+	if err != nil {
+		return closed, err
+	}
+	if err = b.CleanupAutoProtective(ctx, protectiveIDs); err != nil {
+		return closed, err
+	}
+	_, finalPositions, _, err := b.Refresh(ctx)
+	if err != nil || len(finalPositions) != 0 {
+		return closed, fmt.Errorf("auto position is not flat")
 	}
 	return closed, nil
 }

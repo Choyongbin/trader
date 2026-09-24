@@ -76,7 +76,7 @@ func main() {
 			testnet = backend
 		}
 	}
-	app, err := uiapi.NewServer(provider, static, uiapi.Options{TestnetBackend: testnet, AutoPipeline: frozenPipeline, LiveFeatureRuntime: true, LiveBootstrap: true, BootstrapStabilization: 5 * time.Minute, PaperOrders: map[uiapi.TradingEnvironment]bool{
+	app, err := uiapi.NewServer(provider, static, uiapi.Options{ListenAddress: *listen, TestnetBackend: testnet, AutoPipeline: frozenPipeline, LiveFeatureRuntime: true, LiveBootstrap: true, BootstrapStabilization: 5 * time.Minute, PaperOrders: map[uiapi.TradingEnvironment]bool{
 		uiapi.TradingEnvironmentTestnet: false,
 		uiapi.TradingEnvironmentMainnet: false,
 	}})

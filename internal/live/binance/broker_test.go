@@ -9,10 +9,13 @@ import (
 )
 
 type mockTransport struct {
-	submitErr error
-	order     Order
-	calls     []string
-	values    []url.Values
+	submitErr     error
+	algoSubmitErr error
+	algoQueryErr  error
+	order         Order
+	algo          AlgoOrder
+	calls         []string
+	values        []url.Values
 }
 
 func (m *mockTransport) Signed(_ context.Context, method, path string, values url.Values, out any) error {
@@ -21,11 +24,39 @@ func (m *mockTransport) Signed(_ context.Context, method, path string, values ur
 	if path == "/fapi/v1/order" && method == "POST" && m.submitErr != nil {
 		return m.submitErr
 	}
+	if path == "/fapi/v1/algoOrder" && method == "POST" && m.algoSubmitErr != nil {
+		return m.algoSubmitErr
+	}
+	if path == "/fapi/v1/algoOrder" && method == "GET" && m.algoQueryErr != nil {
+		return m.algoQueryErr
+	}
 	if out != nil {
-		b, _ := json.Marshal(m.order)
+		value := any(m.order)
+		if path == "/fapi/v1/algoOrder" {
+			value = m.algo
+		}
+		b, _ := json.Marshal(value)
 		_ = json.Unmarshal(b, out)
 	}
 	return nil
+}
+
+func TestAlgoTimeoutWithFailedLookupReturnsUnknownWithoutRetry(t *testing.T) {
+	m := &mockTransport{algoSubmitErr: errors.New("timeout"), algoQueryErr: errors.New("lookup timeout")}
+	b := &BinanceTestnetBroker{transport: m}
+	_, err := b.ProtectiveStop(context.Background(), "BTCUSDT", "SELL", "0.001", "100", "safe-sl")
+	if !errors.Is(err, ErrSubmitOutcomeUnknown) || len(m.calls) != 2 {
+		t.Fatalf("calls=%v err=%v", m.calls, err)
+	}
+}
+
+func TestAlgoTimeoutAfterAcceptedAdoptsByClientID(t *testing.T) {
+	m := &mockTransport{algoSubmitErr: errors.New("timeout"), algo: AlgoOrder{ClientAlgoID: "safe-sl", AlgoStatus: "NEW"}}
+	b := &BinanceTestnetBroker{transport: m}
+	o, err := b.ProtectiveStop(context.Background(), "BTCUSDT", "SELL", "0.001", "100", "safe-sl")
+	if err != nil || o.ClientOrderID != "safe-sl" || len(m.calls) != 2 || m.calls[1] != "GET /fapi/v1/algoOrder" {
+		t.Fatalf("order=%+v calls=%v err=%v", o, m.calls, err)
+	}
 }
 
 func TestProtectiveOrdersUseCurrentAlgoEndpoint(t *testing.T) {

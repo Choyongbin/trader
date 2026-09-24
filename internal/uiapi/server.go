@@ -64,6 +64,8 @@ type Options struct {
 	LiveFeatureRuntime     bool
 	LiveBootstrap          bool
 	BootstrapStabilization time.Duration
+	ListenAddress          string
+	AutoExecutionStatePath string
 }
 
 type Server struct {
@@ -99,6 +101,15 @@ type Server struct {
 	autoIntents              uint64
 	testnetRefreshMu         sync.Mutex
 	autoExecutionMu          sync.Mutex
+	autoLifecycleMu          sync.Mutex
+	autoDecisionQueue        chan queuedAutoDecision
+	autoLastDecisionMs       int64
+	autoQueueOverflows       uint64
+	autoStaleDecisions       uint64
+	listenAddress            string
+	autoExecutionStatePath   string
+	autoExecutionState       *autoExecutionState
+	autoRecoveryBlocked      bool
 	lastTestnetRefresh       time.Time
 	autoOwnedPosition        bool
 	autoProtectiveIDs        []string
@@ -120,6 +131,10 @@ type Server struct {
 	longSignals              uint64
 	shortSignals             uint64
 	actualOrderSubmits       uint64
+	autoExecutionAttempts    uint64
+	confirmedEntryFills      uint64
+	protectiveOrderSubmits   uint64
+	failedUnknownSubmissions uint64
 	reconciliationEvents     uint64
 	marketReceiveLatency     latencyRing
 	pipelineLatency          latencyRing
@@ -166,6 +181,15 @@ func NewServer(provider credentials.Provider, static fs.FS, options Options) (*S
 	if s.bootstrapStabilization <= 0 {
 		s.bootstrapStabilization = 5 * time.Minute
 	}
+	s.listenAddress = options.ListenAddress
+	if s.listenAddress == "" {
+		s.listenAddress = "127.0.0.1:8080"
+	}
+	s.autoExecutionStatePath = options.AutoExecutionStatePath
+	if s.autoExecutionStatePath == "" && options.LiveFeatureRuntime {
+		s.autoExecutionStatePath = filepath.FromSlash("data/live_state/BTCUSDT/v1/auto-execution-state.json")
+	}
+	s.autoDecisionQueue = make(chan queuedAutoDecision, 8)
 	if s.paperOrders == nil {
 		s.paperOrders = map[TradingEnvironment]bool{}
 	}
@@ -185,6 +209,7 @@ func NewServer(provider credentials.Provider, static fs.FS, options Options) (*S
 		}
 	}
 	s.reloadCredentials()
+	s.loadAutoExecutionState()
 	if warmstate.Read(s.warmupPath, time.Now()).Status == "GAP" {
 		s.logLocked("Warm state rejected due GAP")
 	}
@@ -223,7 +248,8 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 			http.Error(w, "cross-origin request rejected", http.StatusForbidden)
 			return
 		}
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self' ws://127.0.0.1:8080 ws://localhost:8080; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'")
+		_, port, _ := strings.Cut(s.listenAddress, ":")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self' ws://127.0.0.1:"+port+" ws://localhost:"+port+"; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(w, r)
@@ -235,7 +261,8 @@ func (s *Server) sameOrigin(r *http.Request) bool {
 	if origin == "" {
 		return true
 	}
-	return origin == "http://127.0.0.1:8080" || origin == "http://localhost:8080"
+	_, port, ok := strings.Cut(s.listenAddress, ":")
+	return ok && (origin == "http://127.0.0.1:"+port || origin == "http://localhost:"+port)
 }
 
 func (s *Server) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
@@ -374,10 +401,23 @@ func (s *Server) getAutoTrading(w http.ResponseWriter, r *http.Request) {
 	brokerReady := environment == TradingEnvironmentTestnet && s.testnet != nil && autoBrokerReady
 	modelReady := s.autoPipeline != nil
 	autoOrdersEnabled := s.autoOrdersEnabled(environment)
-	overall := len(blockers) == 0 && modelReady && featureSource && autoOrdersEnabled
+	operationalBlockers := 0
+	for _, blocker := range blockers {
+		if blocker.Code != "AUTO_TRADING_RUNNING" {
+			operationalBlockers++
+		}
+	}
+	overall := operationalBlockers == 0 && modelReady && featureSource && autoOrdersEnabled
 	reason := ""
+	for _, blocker := range blockers {
+		if blocker.Code != "AUTO_TRADING_RUNNING" {
+			reason = blocker.Code
+			break
+		}
+	}
+	startBlockedReason := ""
 	if len(blockers) != 0 {
-		reason = blockers[0].Code
+		startBlockedReason = blockers[0].Code
 	}
 	signal := "NOT_READY"
 	if warmupReady && featureSource && lastResult != nil {
@@ -388,7 +428,7 @@ func (s *Server) getAutoTrading(w http.ResponseWriter, r *http.Request) {
 	if reason == "" && !autoOrdersEnabled {
 		reason = "AUTO_ORDERS_DISABLED"
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"environment": environment, "running": running, "state": autoState, "signal": signal, "last_result": lastResult, "selected_model": autopipeline.ProfileID, "blockers": blockers, "readiness": map[string]any{"market_public_data": marketConnected, "feature_warmup": warmupReady, "feature_registry": modelReady, "model": modelReady, "entry_policy": modelReady, "risk_policy": modelReady, "account": accountConnected, "broker": brokerReady, "feature_source": featureSource, "position": map[bool]string{true: "OPEN", false: "FLAT"}[positionOpen], "orders_enabled": s.ordersEnabled(environment), "auto_orders_enabled": autoOrdersEnabled, "overall": overall, "blocked_reason": reason}})
+	writeJSON(w, http.StatusOK, map[string]any{"environment": environment, "running": running, "state": autoState, "signal": signal, "last_result": lastResult, "selected_model": autopipeline.ProfileID, "blockers": blockers, "start_blocked_reason": startBlockedReason, "readiness": map[string]any{"market_public_data": marketConnected, "feature_warmup": warmupReady, "feature_registry": modelReady, "model": modelReady, "entry_policy": modelReady, "risk_policy": modelReady, "account": accountConnected, "broker": brokerReady, "feature_source": featureSource, "position": map[bool]string{true: "OPEN", false: "FLAT"}[positionOpen], "orders_enabled": s.ordersEnabled(environment), "auto_orders_enabled": autoOrdersEnabled, "overall": overall, "blocked_reason": reason}})
 }
 
 func (s *Server) startAuto(w http.ResponseWriter, r *http.Request) {
@@ -462,7 +502,7 @@ func (s *Server) ordersEnabled(environment TradingEnvironment) bool {
 	if environment == TradingEnvironmentMainnet {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("BINANCE_TESTNET_ENABLE_ORDERS")), "true")
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("BINANCE_ENV")), "TESTNET") && strings.EqualFold(strings.TrimSpace(os.Getenv("BINANCE_TESTNET_ENABLE_ORDERS")), "true")
 }
 
 func (s *Server) manualOrder(w http.ResponseWriter, r *http.Request) {
@@ -651,7 +691,9 @@ func (s *Server) getSystem(w http.ResponseWriter, _ *http.Request) {
 		"feature_decisions":   s.featureDecisions, "eligible_decisions": s.eligibleDecisions, "feature_not_ready_decisions": s.featureNotReadyDecisions,
 		"no_trade_signals": s.noTradeSignals, "long_signals": s.longSignals, "short_signals": s.shortSignals,
 		"manual_order_requests": s.manualRequests, "auto_execution_intents": s.autoIntents,
-		"actual_order_submits": s.actualOrderSubmits, "api_errors": s.apiErrors, "reconciliation_events": s.reconciliationEvents,
+		"actual_order_submits": s.actualOrderSubmits, "auto_execution_attempts": s.autoExecutionAttempts, "confirmed_entry_fills": s.confirmedEntryFills,
+		"protective_order_submissions": s.protectiveOrderSubmits, "failed_unknown_submissions": s.failedUnknownSubmissions,
+		"auto_queue_overflows": s.autoQueueOverflows, "auto_stale_decisions": s.autoStaleDecisions, "api_errors": s.apiErrors, "reconciliation_events": s.reconciliationEvents,
 	}
 	latency := map[string]any{"market_receive_ms": s.marketReceiveLatency.summary(), "feature_us": s.featureLatency.summary(), "model_inference_us": s.inferenceLatency.summary(), "policy_us": s.policyLatency.summary(), "pipeline_us": s.pipelineLatency.summary()}
 	started := s.startedAt

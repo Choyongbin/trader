@@ -24,17 +24,13 @@ func (s *Server) runSharedLiveRuntime(ctx context.Context) {
 		running := s.states[TradingEnvironmentTestnet].AutoRunning
 		s.mu.Unlock()
 		if reason == featurev2.Eligible && running {
-			_, _ = s.ProcessFeatureSnapshotAt(snapshot, entryPrice)
+			s.enqueueAutoDecision(snapshot, entryPrice)
 		}
 	}
 	for ctx.Err() == nil {
 		started := time.Now().UTC()
 		restored := false
-		if snapshot, err := warmstate.Load(warmstate.RuntimeSnapshotPath); err == nil {
-			age := started.Sub(time.UnixMilli(snapshot.LastEventTimeMs))
-			maxAge := time.Duration(warmstate.RetentionMs-warmstate.RequiredWarmupMs) * time.Millisecond
-			restored = age >= 0 && age <= maxAge && snapshot.V1State != nil && snapshot.V2State != nil
-		}
+		startupKnown := false
 		var stabilizationStarted time.Time
 		status := func(stats runtimefeature.Stats) {
 			now := time.Now().UTC()
@@ -48,7 +44,7 @@ func (s *Server) runSharedLiveRuntime(ctx context.Context) {
 			stats.Status.HandoffStartedAtMs = started.UnixMilli()
 			stats.Status.HandoffCompletedAtMs = started.UnixMilli()
 			stats.Status.StabilizationTargetMs = s.bootstrapStabilization.Milliseconds()
-			if restored {
+			if startupKnown && restored {
 				stats.Status.BootstrapState = "READY"
 				stats.Status.StabilizationReady = true
 				stats.Status.StabilizationElapsed = true
@@ -81,11 +77,13 @@ func (s *Server) runSharedLiveRuntime(ctx context.Context) {
 			s.mu.Unlock()
 		}
 		onStarted := func(result livesession.Result) {
+			startupKnown = true
+			restored = result.SnapshotRestored && result.RestoreApplied && !result.FullBootstrap
 			s.mu.Lock()
 			s.logLocked("Shared live runtime ready: " + result.StartupMode)
 			s.mu.Unlock()
 		}
-		_, err := livesession.Run(ctx, livesession.Options{Duration: 29 * time.Minute, SnapshotPath: warmstate.RuntimeSnapshotPath, OnDecision: decision, OnStatus: status, OnEvent: s.consumeSharedLiveEvent, OnStarted: onStarted})
+		_, err := livesession.Run(ctx, livesession.Options{Duration: 0, SnapshotPath: warmstate.RuntimeSnapshotPath, OnDecision: decision, OnStatus: status, OnEvent: s.consumeSharedLiveEvent, OnStarted: onStarted})
 		if ctx.Err() != nil {
 			return
 		}
