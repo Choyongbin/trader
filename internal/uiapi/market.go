@@ -19,11 +19,6 @@ func (s *Server) RunPublicMarketFeed(ctx context.Context) {
 		return
 	}
 	var featureEvents chan liveFeatureEvent
-	if s.liveFeatureRuntime {
-		featureEvents = make(chan liveFeatureEvent, 8192)
-		go s.runLiveFeature(ctx, featureEvents)
-		go s.pollLiveExternal(ctx, featureEvents)
-	}
 	sendFeature := func(event liveFeatureEvent) {
 		if featureEvents == nil {
 			return

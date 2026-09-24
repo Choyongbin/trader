@@ -106,11 +106,13 @@ func TestSecretSafetyCSRFAndEnvironmentRequirement(t *testing.T) {
 }
 
 func TestManualFlowSeparationDoubleSubmitAndAutoGate(t *testing.T) {
-	oldTest, oldMain := os.Getenv("BINANCE_TESTNET_ENABLE_ORDERS"), os.Getenv("BINANCE_MAINNET_ENABLE_ORDERS")
+	oldEnv, oldTest, oldMain := os.Getenv("BINANCE_ENV"), os.Getenv("BINANCE_TESTNET_ENABLE_ORDERS"), os.Getenv("BINANCE_MAINNET_ENABLE_ORDERS")
 	t.Cleanup(func() {
+		_ = os.Setenv("BINANCE_ENV", oldEnv)
 		_ = os.Setenv("BINANCE_TESTNET_ENABLE_ORDERS", oldTest)
 		_ = os.Setenv("BINANCE_MAINNET_ENABLE_ORDERS", oldMain)
 	})
+	_ = os.Setenv("BINANCE_ENV", "TESTNET")
 	_ = os.Setenv("BINANCE_TESTNET_ENABLE_ORDERS", "true")
 	_ = os.Setenv("BINANCE_MAINNET_ENABLE_ORDERS", "false")
 	s := testServer(t)
@@ -139,6 +141,30 @@ func TestManualFlowSeparationDoubleSubmitAndAutoGate(t *testing.T) {
 	}
 	if perform(h, http.MethodPost, "/api/manual-order", token, ManualOrderRequest{Environment: TradingEnvironmentMainnet, Symbol: "BTCUSDT", Side: "SHORT", OrderType: "MARKET", MarginAmountUSDT: 100, Leverage: 3, RequestID: "main", LiveConfirmation: "CONFIRM LIVE ORDER"}).Code != http.StatusConflict {
 		t.Fatal("Mainnet orders-disabled guard failed")
+	}
+}
+
+func TestOriginAndCSPFollowConfiguredListenPort(t *testing.T) {
+	s := testServer(t)
+	s.listenAddress = "127.0.0.1:9090"
+	h := s.Handler()
+	request := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	request.Header.Set("Origin", "http://localhost:9090")
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("configured origin rejected: %d", recorder.Code)
+	}
+	csp := recorder.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "ws://127.0.0.1:9090") || !strings.Contains(csp, "ws://localhost:9090") {
+		t.Fatalf("CSP does not follow listen port: %s", csp)
+	}
+	request = httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	request.Header.Set("Origin", "http://127.0.0.1:8080")
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatal("origin on a different port was accepted")
 	}
 }
 

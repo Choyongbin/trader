@@ -157,7 +157,19 @@ func (b *BinanceTestnetBroker) submitAlgo(ctx context.Context, symbol, side, qua
 		"reduceOnly": {"true"}, "clientAlgoId": {clientID}, "newOrderRespType": {"RESULT"},
 	}
 	var x AlgoOrder
-	err := b.transport.Signed(ctx, http.MethodPost, "/fapi/v1/algoOrder", v, &x)
+	if err := b.transport.Signed(ctx, http.MethodPost, "/fapi/v1/algoOrder", v, &x); err != nil {
+		adopted, queryErr := b.GetAlgoOrder(ctx, clientID)
+		if queryErr == nil && adopted.ClientAlgoID == clientID {
+			return adopted, nil
+		}
+		return x, fmt.Errorf("%w: algo submit=%v query=%v", ErrSubmitOutcomeUnknown, err, queryErr)
+	}
+	return x, nil
+}
+
+func (b *BinanceTestnetBroker) GetAlgoOrder(ctx context.Context, clientID string) (AlgoOrder, error) {
+	var x AlgoOrder
+	err := b.transport.Signed(ctx, http.MethodGet, "/fapi/v1/algoOrder", url.Values{"clientAlgoId": {clientID}}, &x)
 	return x, err
 }
 

@@ -58,8 +58,11 @@ type externalResult struct {
 }
 
 func Run(ctx context.Context, options Options) (Result, error) {
-	if options.Duration <= 0 || options.SnapshotPath == "" {
-		return Result{}, fmt.Errorf("invalid live session options")
+	if err := validateOptions(options); err != nil {
+		return Result{}, err
+	}
+	if ctx.Err() != nil {
+		return Result{}, nil
 	}
 	started := time.Now()
 	runCtx, cancel := context.WithCancel(ctx)
@@ -94,6 +97,9 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	}
 	buffered, health, err := collectLiveStart(runCtx, batches)
 	if err != nil {
+		if ctx.Err() != nil {
+			return result, nil
+		}
 		return result, err
 	}
 	fullBootstrap := func(mode string) error {
@@ -170,8 +176,13 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	finalize := func() {
 		finalizeResult(&result, baseline, engine.Status(time.Now()), time.Since(liveStarted))
 	}
-	deadline := time.NewTimer(options.Duration)
-	defer deadline.Stop()
+	var deadline <-chan time.Time
+	var deadlineTimer *time.Timer
+	if options.Duration > 0 {
+		deadlineTimer = time.NewTimer(options.Duration)
+		deadline = deadlineTimer.C
+		defer deadlineTimer.Stop()
+	}
 	snapshotTicker := time.NewTicker(30 * time.Second)
 	defer snapshotTicker.Stop()
 	for {
@@ -203,7 +214,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 				finalize()
 				return result, err
 			}
-		case <-deadline.C:
+		case <-deadline:
 			cancel()
 			if err = saveSnapshot(engine, options.SnapshotPath); err != nil {
 				finalize()
@@ -218,7 +229,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			}
 			if runCtx.Err() != nil {
 				if ctx.Err() != nil {
-					return result, ctx.Err()
+					return result, nil
 				}
 				return result, runCtx.Err()
 			}
@@ -232,9 +243,16 @@ func Run(ctx context.Context, options Options) (Result, error) {
 				return result, saveErr
 			}
 			finalize()
-			return result, ctx.Err()
+			return result, nil
 		}
 	}
+}
+
+func validateOptions(options Options) error {
+	if options.Duration < 0 || options.SnapshotPath == "" {
+		return fmt.Errorf("invalid live session options")
+	}
+	return nil
 }
 
 func snapshotHasWarmCoverage(snapshot warmstate.Snapshot) bool {

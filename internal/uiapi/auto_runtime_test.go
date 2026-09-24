@@ -31,6 +31,7 @@ func (*failingReadBackend) ClosePosition(context.Context, string) (binance.Order
 }
 
 func TestExchangeUnknownRejectsNewEntries(t *testing.T) {
+	t.Setenv("BINANCE_ENV", "TESTNET")
 	t.Setenv("BINANCE_TESTNET_ENABLE_ORDERS", "true")
 	backend := &failingReadBackend{}
 	static := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("console")}}
@@ -67,6 +68,7 @@ func TestExchangeUnknownRejectsNewEntries(t *testing.T) {
 }
 
 func TestAutoStateMachineReadyFixtureAndStop(t *testing.T) {
+	t.Setenv("BINANCE_ENV", "TESTNET")
 	t.Setenv("BINANCE_TESTNET_ENABLE_ORDERS", "true")
 	t.Setenv("BINANCE_TESTNET_ENABLE_AUTO_ORDERS", "true")
 	path := filepath.Join(t.TempDir(), "capture-state.json")
@@ -114,6 +116,7 @@ func TestAutoStateMachineReadyFixtureAndStop(t *testing.T) {
 }
 
 func TestExecuteAutoIntentUsesDedicatedDemoAutoBackend(t *testing.T) {
+	t.Setenv("BINANCE_ENV", "TESTNET")
 	t.Setenv("BINANCE_TESTNET_ENABLE_ORDERS", "true")
 	t.Setenv("BINANCE_TESTNET_ENABLE_AUTO_ORDERS", "true")
 	backend := &fakeTestnetBackend{}
@@ -142,6 +145,7 @@ func TestExecuteAutoIntentUsesDedicatedDemoAutoBackend(t *testing.T) {
 }
 
 func TestAutoOrderGateIsSeparateFromManualOrderGate(t *testing.T) {
+	t.Setenv("BINANCE_ENV", "TESTNET")
 	t.Setenv("BINANCE_TESTNET_ENABLE_ORDERS", "true")
 	t.Setenv("BINANCE_TESTNET_ENABLE_AUTO_ORDERS", "false")
 	backend := &fakeTestnetBackend{}
@@ -168,16 +172,31 @@ func TestAutoOrderGateIsSeparateFromManualOrderGate(t *testing.T) {
 type horizonBackend struct {
 	open       bool
 	closeCalls int
+	closeIDs   []string
+	closeSide  string
+	closeQty   float64
+	unrelated  bool
+	side       string
 }
 
 func (b *horizonBackend) Refresh(context.Context) (Balance, []Position, []Order, error) {
 	wallet, available, margin, used, pnl := 1000.0, 900.0, 1000.0, 100.0, 0.0
 	balance := Balance{true, "CONNECTED", &wallet, &available, &margin, &used, &pnl}
 	if !b.open {
+		if b.unrelated {
+			return balance, nil, []Order{{ClientOrderID: "manual-algo"}}, nil
+		}
 		return balance, nil, nil, nil
 	}
-	position := Position{Environment: TradingEnvironmentTestnet, Symbol: "BTCUSDT", Side: "LONG", QuantityBTC: .001, EntryPrice: 100000, MarkPrice: 100000, Leverage: 1, MarginUSDT: 100}
+	positionSide := b.side
+	if positionSide == "" {
+		positionSide = "LONG"
+	}
+	position := Position{Environment: TradingEnvironmentTestnet, Symbol: "BTCUSDT", Side: positionSide, QuantityBTC: .001, EntryPrice: 100000, MarkPrice: 100000, Leverage: 1, MarginUSDT: 100}
 	orders := []Order{{Environment: TradingEnvironmentTestnet, Symbol: "BTCUSDT", ClientOrderID: "tp", Protective: "TP"}, {Environment: TradingEnvironmentTestnet, Symbol: "BTCUSDT", ClientOrderID: "sl", Protective: "SL"}}
+	if b.unrelated {
+		orders = append(orders, Order{ClientOrderID: "manual-algo"})
+	}
 	return balance, []Position{position}, orders, nil
 }
 func (*horizonBackend) SubmitManual(context.Context, ManualOrderRequest) (ManualExecution, error) {
@@ -188,13 +207,40 @@ func (b *horizonBackend) ClosePosition(context.Context, string) (binance.Order, 
 	b.open = false
 	return binance.Order{Status: "FILLED"}, nil
 }
+func (b *horizonBackend) CloseAutoPosition(ctx context.Context, requestID string, ids []string, side string, quantity float64) (binance.Order, error) {
+	b.closeIDs = append([]string(nil), ids...)
+	b.closeSide = side
+	b.closeQty = quantity
+	return b.ClosePosition(ctx, requestID)
+}
+
+func TestShortHorizonCloseUsesOwnedSideAndQuantity(t *testing.T) {
+	backend := &horizonBackend{open: true, side: "SHORT"}
+	static := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("console")}}
+	s, err := NewServer(fakeProvider{credentials.CredentialStore{}}, static, Options{TestnetBackend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.autoOwnedPosition = true
+	s.autoProtectiveIDs = []string{"tp", "sl"}
+	s.autoExitDeadline = time.Now().Add(-time.Second)
+	s.autoCloseRequestID = "short-close"
+	s.mu.Unlock()
+	if _, err = s.reconcileAutoLifecycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if backend.closeSide != "SHORT" || backend.closeQty != .001 || backend.closeCalls != 1 {
+		t.Fatalf("side=%s qty=%g calls=%d", backend.closeSide, backend.closeQty, backend.closeCalls)
+	}
+}
 func (*horizonBackend) SubmitAuto(context.Context, autopipeline.ExecutionIntent) (ManualExecution, error) {
 	return ManualExecution{}, errors.New("unused")
 }
 func (*horizonBackend) CleanupAutoProtective(context.Context, []string) error { return nil }
 
 func TestAutoOwnedPositionClosesAtFrozenHoldingHorizon(t *testing.T) {
-	backend := &horizonBackend{open: true}
+	backend := &horizonBackend{open: true, unrelated: true}
 	static := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("console")}}
 	s, err := NewServer(fakeProvider{credentials.CredentialStore{Testnet: credentials.EnvironmentCredentials{APIKey: "key", APISecret: "secret"}}}, static, Options{TestnetBackend: backend})
 	if err != nil {
@@ -215,9 +261,42 @@ func TestAutoOwnedPositionClosesAtFrozenHoldingHorizon(t *testing.T) {
 	if holding || backend.closeCalls != 1 {
 		t.Fatalf("holding=%t closeCalls=%d", holding, backend.closeCalls)
 	}
+	if len(backend.closeIDs) != 2 || backend.closeIDs[0] != "tp" || backend.closeIDs[1] != "sl" {
+		t.Fatalf("owned cleanup IDs=%v", backend.closeIDs)
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.autoOwnedPosition || !s.autoExitDeadline.IsZero() || s.autoCloseRequestID != "" || s.states[TradingEnvironmentTestnet].AutoState != "RUNNING" {
 		t.Fatalf("horizon cleanup state: owned=%t deadline=%v closeID=%q state=%s", s.autoOwnedPosition, s.autoExitDeadline, s.autoCloseRequestID, s.states[TradingEnvironmentTestnet].AutoState)
+	}
+}
+
+func TestConcurrentHorizonReconciliationClosesOnce(t *testing.T) {
+	backend := &horizonBackend{open: true}
+	static := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("console")}}
+	s, err := NewServer(fakeProvider{credentials.CredentialStore{}}, static, Options{TestnetBackend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.autoOwnedPosition = true
+	s.autoProtectiveIDs = []string{"tp", "sl"}
+	s.autoExitDeadline = time.Now().Add(-time.Second)
+	s.autoCloseRequestID = "one-close"
+	s.mu.Unlock()
+	done := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, reconcileErr := s.reconcileAutoLifecycle(context.Background())
+			done <- reconcileErr
+		}()
+	}
+	for range 2 {
+		if reconcileErr := <-done; reconcileErr != nil {
+			t.Fatal(reconcileErr)
+		}
+	}
+	if backend.closeCalls != 1 {
+		t.Fatalf("close calls=%d want=1", backend.closeCalls)
 	}
 }

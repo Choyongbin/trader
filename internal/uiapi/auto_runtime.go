@@ -10,6 +10,55 @@ import (
 	"binance_trader/internal/live/autopipeline"
 )
 
+type queuedAutoDecision struct {
+	snapshot   featurev2.Snapshot
+	entryPrice float64
+}
+
+const maxAutoDecisionAge = 15 * time.Second
+
+func (s *Server) enqueueAutoDecision(snapshot featurev2.Snapshot, entryPrice float64) {
+	s.mu.Lock()
+	if snapshot.DecisionTimestampMs <= s.autoLastDecisionMs {
+		s.mu.Unlock()
+		return
+	}
+	s.autoLastDecisionMs = snapshot.DecisionTimestampMs
+	s.mu.Unlock()
+	select {
+	case s.autoDecisionQueue <- queuedAutoDecision{snapshot: snapshot, entryPrice: entryPrice}:
+	default:
+		s.mu.Lock()
+		s.autoQueueOverflows++
+		s.logLocked("Auto decision queue overflow; signal dropped")
+		s.mu.Unlock()
+	}
+}
+
+func (s *Server) runAutoWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case decision := <-s.autoDecisionQueue:
+			s.mu.RLock()
+			running := s.states[TradingEnvironmentTestnet].AutoRunning
+			s.mu.RUnlock()
+			if !running {
+				continue
+			}
+			if age := s.now().UTC().Sub(time.UnixMilli(decision.snapshot.DecisionTimestampMs)); age < 0 || age > maxAutoDecisionAge {
+				s.mu.Lock()
+				s.autoStaleDecisions++
+				s.logLocked("Stale auto decision dropped")
+				s.mu.Unlock()
+				continue
+			}
+			_, _ = s.ProcessFeatureSnapshotAt(decision.snapshot, decision.entryPrice)
+		}
+	}
+}
+
 // ProcessFeatureSnapshot is retained for deterministic fixtures. Live runtime
 // passes the completed canonical bar close to ProcessFeatureSnapshotAt.
 func (s *Server) ProcessFeatureSnapshot(snapshot featurev2.Snapshot) (autopipeline.Result, error) {
@@ -26,6 +75,8 @@ func (s *Server) ProcessFeatureSnapshot(snapshot featurev2.Snapshot) (autopipeli
 // when both Testnet order gates are explicitly armed, submits the resulting
 // ExecutionIntent to Binance Futures Demo. Mainnet is never reachable here.
 func (s *Server) ProcessFeatureSnapshotAt(snapshot featurev2.Snapshot, entryPrice float64) (autopipeline.Result, error) {
+	s.autoLifecycleMu.Lock()
+	defer s.autoLifecycleMu.Unlock()
 	s.mu.RLock()
 	running := s.states[TradingEnvironmentTestnet].AutoRunning
 	s.mu.RUnlock()

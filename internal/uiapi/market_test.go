@@ -78,6 +78,7 @@ func TestUnavailableFeatureSignalIsNotReady(t *testing.T) {
 }
 
 func TestLiveInputConnectedButHistoricalGapDoesNotStartAuto(t *testing.T) {
+	t.Setenv("BINANCE_ENV", "TESTNET")
 	static := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("console")}}
 	path := filepath.Join(t.TempDir(), "capture-state.json")
 	s, err := NewServer(fakeProvider{credentials.CredentialStore{}}, static, Options{WarmupPath: path, AutoFeatureSource: true, LiveFeatureRuntime: true})
