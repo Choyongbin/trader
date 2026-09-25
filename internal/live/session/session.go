@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	live "binance_trader/internal/live/binance"
@@ -315,26 +316,49 @@ func mergeHandoff(catchup, buffered []live.CaptureEvent) []live.CaptureEvent {
 }
 
 func pollExternal(ctx context.Context, out chan<- externalResult) {
-	fetch := func() {
-		pollCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
-		rows, err := live.FetchPublicObservations(pollCtx)
-		cancel()
-		select {
-		case out <- externalResult{rows: rows, err: err}:
-		case <-ctx.Done():
+	pollExternalWithFetch(ctx, out, live.FetchPublicKlineObservations, live.FetchPublicSlowObservations, 10*time.Second, 30*time.Second)
+}
+
+// pollExternalWithFetch separates cadences without changing the receive pipeline.
+func pollExternalWithFetch(ctx context.Context, out chan<- externalResult, fast, slow func(context.Context) ([]live.ExternalObservation, error), fastInterval, slowInterval time.Duration) {
+	var wg sync.WaitGroup
+	poll := func(interval, timeout time.Duration, fetcher func(context.Context) ([]live.ExternalObservation, error)) {
+		defer wg.Done()
+		fetch := func() bool {
+			pollCtx, cancel := context.WithTimeout(ctx, timeout)
+			rows, err := fetcher(pollCtx)
+			cancel()
+			select {
+			case out <- externalResult{rows: rows, err: err}:
+				return true
+			case <-ctx.Done():
+				return false
+			}
 		}
-	}
-	fetch()
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			fetch()
-		case <-ctx.Done():
+		if !fetch() {
 			return
 		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if !fetch() {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
 	}
+
+	// Run the one-minute kline and five-minute metrics pollers independently.
+	// A slow metrics request cannot delay the 10-second kline cadence.
+	wg.Add(2)
+	go poll(fastInterval, 15*time.Second, fast)
+	go poll(slowInterval, 25*time.Second, slow)
+	<-ctx.Done()
+	wg.Wait()
 }
 
 func collectLiveStart(ctx context.Context, batches <-chan live.CaptureResult) ([]live.CaptureEvent, map[string]*live.SourceHealth, error) {

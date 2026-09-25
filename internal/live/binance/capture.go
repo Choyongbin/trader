@@ -63,21 +63,51 @@ const (
 	OriginLiveReceived     DataOrigin = "LIVE_RECEIVED"
 )
 
+type publicObservationEndpoint struct {
+	name string
+	url  string
+}
+
+var publicKlineObservationEndpoints = []publicObservationEndpoint{
+	{"mark", "https://fapi.binance.com/fapi/v1/markPriceKlines?symbol=BTCUSDT&interval=1m&limit=2"},
+	{"index", "https://fapi.binance.com/fapi/v1/indexPriceKlines?pair=BTCUSDT&interval=1m&limit=2"},
+	{"premium", "https://fapi.binance.com/fapi/v1/premiumIndexKlines?symbol=BTCUSDT&interval=1m&limit=2"},
+}
+
+var publicSlowObservationEndpoints = []publicObservationEndpoint{
+	{"funding", "https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=2"},
+	{"metrics_oi", "https://fapi.binance.com/futures/data/openInterestHist?symbol=BTCUSDT&period=5m&limit=2"},
+	{"metrics_global", "https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=BTCUSDT&period=5m&limit=2"},
+	{"metrics_top_account", "https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol=BTCUSDT&period=5m&limit=2"},
+	{"metrics_top_position", "https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol=BTCUSDT&period=5m&limit=2"},
+	{"metrics_taker", "https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=BTCUSDT&period=5m&limit=2"},
+}
+
 func FetchPublicObservations(ctx context.Context) ([]ExternalObservation, error) {
-	urls := map[string]string{
-		"mark":                 "https://fapi.binance.com/fapi/v1/markPriceKlines?symbol=BTCUSDT&interval=1m&limit=2",
-		"index":                "https://fapi.binance.com/fapi/v1/indexPriceKlines?pair=BTCUSDT&interval=1m&limit=2",
-		"premium":              "https://fapi.binance.com/fapi/v1/premiumIndexKlines?symbol=BTCUSDT&interval=1m&limit=2",
-		"funding":              "https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=2",
-		"metrics_oi":           "https://fapi.binance.com/futures/data/openInterestHist?symbol=BTCUSDT&period=5m&limit=2",
-		"metrics_global":       "https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=BTCUSDT&period=5m&limit=2",
-		"metrics_top_account":  "https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol=BTCUSDT&period=5m&limit=2",
-		"metrics_top_position": "https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol=BTCUSDT&period=5m&limit=2",
-		"metrics_taker":        "https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=BTCUSDT&period=5m&limit=2",
-	}
+	endpoints := make([]publicObservationEndpoint, 0, len(publicKlineObservationEndpoints)+len(publicSlowObservationEndpoints))
+	endpoints = append(endpoints, publicKlineObservationEndpoints...)
+	endpoints = append(endpoints, publicSlowObservationEndpoints...)
+	return fetchPublicObservations(ctx, endpoints)
+}
+
+// FetchPublicKlineObservations polls only one-minute mark/index/premium data.
+// This lets the live runtime use a faster cadence without increasing the load
+// on five-minute metrics endpoints.
+func FetchPublicKlineObservations(ctx context.Context) ([]ExternalObservation, error) {
+	return fetchPublicObservations(ctx, publicKlineObservationEndpoints)
+}
+
+// FetchPublicSlowObservations keeps funding and all five metrics endpoints in
+// one fetch so runtimefeature can preserve exact-timestamp metrics assembly.
+func FetchPublicSlowObservations(ctx context.Context) ([]ExternalObservation, error) {
+	return fetchPublicObservations(ctx, publicSlowObservationEndpoints)
+}
+
+func fetchPublicObservations(ctx context.Context, endpoints []publicObservationEndpoint) ([]ExternalObservation, error) {
 	client := &http.Client{Timeout: 12 * time.Second}
-	out := make([]ExternalObservation, 0, 18)
-	for name, u := range urls {
+	out := make([]ExternalObservation, 0, 2*len(endpoints))
+	for _, endpoint := range endpoints {
+		name, u := endpoint.name, endpoint.url
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		resp, err := client.Do(req)
 		if err != nil {
