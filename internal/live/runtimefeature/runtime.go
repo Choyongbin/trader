@@ -25,6 +25,8 @@ type Stats struct {
 	FuturesGaps, SpotGaps                                                                       int64
 	DuplicateEvents, ReverseEvents, IDGaps                                                      int64
 	ExternalUpdates, FeatureDecisions, EligibleDecisions, NotReadyDecisions, FutureObservations int64
+	RuntimeResets                                                                               int64
+	LastResetReason                                                                             string
 	LastDecisionMs                                                                              int64
 	SourceLastMs                                                                                map[string]int64
 	MetricSources                                                                               map[string]MetricSourceHealth
@@ -205,6 +207,14 @@ func (r *Runtime) reset(gap bool) {
 	r.gap = gap
 }
 
+// invalidate preserves the cause of every loss of live warm state. Counters
+// intentionally survive reset; a restore_applied flag alone is not readiness.
+func (r *Runtime) invalidate(reason string) {
+	r.stats.RuntimeResets++
+	r.stats.LastResetReason = reason
+	r.reset(true)
+}
+
 // Connection changes invalidate continuity. A reconnect never bridges an
 // unobserved interval with synthetic no-trade bars.
 func (r *Runtime) Connection(source string, connected bool) {
@@ -214,7 +224,7 @@ func (r *Runtime) Connection(source string, connected bool) {
 	if !connected && r.connected[source] {
 		r.restore = nil
 		r.firstEvents = nil
-		r.reset(true)
+		r.invalidate("LIVE_DISCONNECT:" + source)
 		if source == "futures" {
 			r.stats.FuturesGaps++
 		} else {
@@ -291,7 +301,7 @@ func (r *Runtime) tryRestore(first map[string]live.CaptureEvent, now time.Time) 
 	reject := func(reason string) {
 		r.stats.RestoreApplied = false
 		r.stats.RestoreRejectReason = reason
-		r.reset(true)
+		r.invalidate("RESTORE_REJECTED:" + reason)
 	}
 	if !fo || !po {
 		reject("MISSING_FIRST_EVENT")
@@ -338,9 +348,42 @@ func (r *Runtime) tryRestore(first map[string]live.CaptureEvent, now time.Time) 
 	r.stats.BootstrapSeeded = true
 	r.stats.RestoreApplied = true
 	r.stats.RestoreRejectReason = ""
-	for _, row := range s.External {
-		if row.SourceTimestampMs > r.lastExternal[row.Dataset] {
-			r.lastExternal[row.Dataset] = row.SourceTimestampMs
+	// The snapshot stores five raw metrics_* sources, but parseExternal merges
+	// them into one canonical "metrics" stream. Derive the watermarks from the
+	// *restored V2 state*, never the raw snapshot names or the possibly newer
+	// raw observations that were received but not yet applied to V2.
+	cursors := map[string]int64{}
+	if n := len(s.V2State.Metrics); n > 0 {
+		cursors["metrics"] = s.V2State.Metrics[n-1].TimestampMs
+	}
+	for _, item := range []struct {
+		name string
+		rows []featurev2.KlineObservation
+	}{
+		{"mark", s.V2State.Mark},
+		{"index", s.V2State.Index},
+		{"premium", s.V2State.Premium},
+	} {
+		if n := len(item.rows); n > 0 {
+			cursors[item.name] = item.rows[n-1].OpenTimeMs
+		}
+	}
+	if n := len(s.V2State.Funding); n > 0 {
+		cursors["funding"] = s.V2State.Funding[n-1].TimestampMs
+	}
+	// AddExternal may already have queued an initial public poll while the
+	// first two exchange streams were arriving. Drop only observations already
+	// inside the restored engine and retain genuinely newer queued sources.
+	pending := r.external[:0]
+	for _, value := range r.external {
+		if value.sourceMs > cursors[value.dataset] {
+			pending = append(pending, value)
+		}
+	}
+	r.external = pending
+	for name, ts := range cursors {
+		if ts > r.lastExternal[name] {
+			r.lastExternal[name] = ts
 		}
 	}
 }
@@ -365,7 +408,7 @@ func (r *Runtime) addTrade(event live.CaptureEvent) error {
 	r.stats.ReverseEvents += stream.Reverse - beforeR
 	r.stats.IDGaps += stream.IDGaps - beforeG
 	if err != nil {
-		r.reset(true)
+		r.invalidate("CANONICAL_STREAM_ERROR:" + source + ":" + err.Error())
 		if source == "futures" {
 			r.stats.FuturesGaps++
 		} else {
@@ -426,7 +469,7 @@ func (r *Runtime) drain() {
 				return
 			}
 			if len(r.pairs) > 60 {
-				r.reset(true)
+				r.invalidate("CANONICAL_PAIR_INCOMPLETE")
 				r.stats.FuturesGaps++
 				r.stats.SpotGaps++
 			}
@@ -434,7 +477,7 @@ func (r *Runtime) drain() {
 		}
 		delete(r.pairs, earliest)
 		if r.lastBar != 0 && earliest != r.lastBar+1000 {
-			r.reset(true)
+			r.invalidate("CANONICAL_TIME_DISCONTINUITY")
 			r.stats.FuturesGaps++
 			r.stats.SpotGaps++
 		}
@@ -443,13 +486,13 @@ func (r *Runtime) drain() {
 		}
 		r.lastBar = earliest
 		if err := r.v2.AddSpot(*p.spot); err != nil {
-			r.reset(true)
+			r.invalidate("SPOT_ENGINE_ERROR:" + err.Error())
 			r.stats.SpotGaps++
 			return
 		}
 		row, err := r.v1.Add(*p.futures)
 		if err != nil {
-			r.reset(true)
+			r.invalidate("FUTURES_FEATURE_ERROR:" + err.Error())
 			r.stats.FuturesGaps++
 			return
 		}
@@ -474,7 +517,7 @@ func (r *Runtime) drain() {
 				e = r.v2.AddFunding(*x.funding)
 			}
 			if e != nil {
-				r.reset(true)
+				r.invalidate("EXTERNAL_ENGINE_ERROR:" + x.dataset + ":" + e.Error())
 				return
 			}
 		}
@@ -493,7 +536,7 @@ func (r *Runtime) drain() {
 			r.stats.FutureObservations++
 		}
 		if err != nil && reason != featurev2.FutureObservation {
-			r.reset(true)
+			r.invalidate("FEATURE_V2_ERROR:" + string(reason) + ":" + err.Error())
 			return
 		}
 		if reason == featurev2.Eligible {
@@ -643,6 +686,8 @@ func (r *Runtime) Status(now time.Time) Stats {
 		available = warmstate.RequiredWarmupMs
 	}
 	status := warmstate.Status{Status: "CAPTURING", Source: "traderui_live_runtime", RequiredMs: warmstate.RequiredWarmupMs, AvailableMs: available, MissingMs: warmstate.RequiredWarmupMs - available, ProgressPercent: 100 * float64(available) / float64(warmstate.RequiredWarmupMs), InputConnected: r.connected["futures"] && r.connected["spot"], CurrentCaptureStartMs: r.historyStart, LastEventTimeMs: r.lastBar, LastCheckpointMs: now.UnixMilli(), FuturesBars: int(s.FuturesBars), SpotBars: int(s.SpotBars), FuturesGaps: int(s.FuturesGaps), SpotGaps: int(s.SpotGaps), ExternalObservations: int(s.ExternalUpdates), FutureObservations: s.FutureObservations}
+	status.RuntimeResets = s.RuntimeResets
+	status.LastResetReason = s.LastResetReason
 	status.FuturesHistoryMs = available
 	status.SpotHistoryMs = available
 	status.BootstrapReady = s.BootstrapSeeded

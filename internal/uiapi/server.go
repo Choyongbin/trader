@@ -66,6 +66,7 @@ type Options struct {
 	BootstrapStabilization time.Duration
 	ListenAddress          string
 	AutoExecutionStatePath string
+	LiveSnapshotPath       string
 }
 
 type Server struct {
@@ -108,6 +109,7 @@ type Server struct {
 	autoStaleDecisions       uint64
 	listenAddress            string
 	autoExecutionStatePath   string
+	liveSnapshotPath         string
 	autoExecutionState       *autoExecutionState
 	autoRecoveryBlocked      bool
 	lastTestnetRefresh       time.Time
@@ -188,6 +190,10 @@ func NewServer(provider credentials.Provider, static fs.FS, options Options) (*S
 	s.autoExecutionStatePath = options.AutoExecutionStatePath
 	if s.autoExecutionStatePath == "" && options.LiveFeatureRuntime {
 		s.autoExecutionStatePath = filepath.FromSlash("data/live_state/BTCUSDT/v1/auto-execution-state.json")
+	}
+	s.liveSnapshotPath = options.LiveSnapshotPath
+	if s.liveSnapshotPath == "" {
+		s.liveSnapshotPath = filepath.FromSlash(warmstate.RuntimeSnapshotPath)
 	}
 	s.autoDecisionQueue = make(chan queuedAutoDecision, 8)
 	if s.paperOrders == nil {
@@ -488,14 +494,24 @@ func (s *Server) stopAuto(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.states[environment].AutoState = "STOPPING"
 	s.states[environment].AutoRunning = false
-	s.states[environment].AutoState = "STOPPED"
+	riskState := "NONE"
+	switch {
+	case environment == TradingEnvironmentTestnet && s.autoRecoveryBlocked:
+		s.states[environment].AutoState = "UNKNOWN_EXECUTION_STATE"
+		riskState = "OPERATOR_RECONCILIATION_REQUIRED"
+	case environment == TradingEnvironmentTestnet && s.autoOwnedPosition:
+		s.states[environment].AutoState = "POSITION_PROTECTED_STOPPED"
+		riskState = "EXISTING_POSITION_RISK_MANAGEMENT_ACTIVE"
+	default:
+		s.states[environment].AutoState = "STOPPED"
+	}
 	if r.URL.Path == "/api/auto-trading/emergency-stop" {
 		s.states[environment].KillSwitch = true
 		s.logLocked("Kill switch activated: " + string(environment))
 	}
 	s.logLocked("new entries stopped: " + string(environment))
 	s.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"environment": environment, "running": false, "existing_risk_management": "PRESERVED", "kill_switch_active": r.URL.Path == "/api/auto-trading/emergency-stop"})
+	writeJSON(w, http.StatusOK, map[string]any{"environment": environment, "running": false, "existing_risk_management": "PRESERVED", "existing_risk_state": riskState, "kill_switch_active": r.URL.Path == "/api/auto-trading/emergency-stop"})
 }
 
 func (s *Server) ordersEnabled(environment TradingEnvironment) bool {
@@ -585,18 +601,18 @@ func (s *Server) manualOrder(w http.ResponseWriter, r *http.Request) {
 
 func buildPaperExecution(request ManualOrderRequest, price, executedQuantity float64) (Order, Position, []Order) {
 	now := time.Now().UTC()
-	order := Order{now, request.Environment, request.Symbol, request.Side, request.OrderType, executedQuantity, price, "FILLED_PAPER", request.RequestID, ""}
+	order := Order{now, request.Environment, request.Symbol, request.Side, request.OrderType, executedQuantity, price, "FILLED_PAPER", request.RequestID, "", false}
 	position := Position{Environment: request.Environment, Symbol: request.Symbol, Side: request.Side, QuantityBTC: executedQuantity, NotionalUSDT: executedQuantity * price, EntryPrice: price, MarkPrice: price, Leverage: request.Leverage, MarginUSDT: request.MarginAmountUSDT, OpenedAt: now}
 	protective := []Order{}
 	if request.TakeProfit != nil && request.TakeProfit.Enabled {
 		value := protectivePrice(price, request.Side, true, *request.TakeProfit)
 		position.TakeProfit = &value
-		protective = append(protective, Order{now, request.Environment, request.Symbol, opposite(request.Side), "TAKE_PROFIT_MARKET", executedQuantity, value, "NEW_PAPER", request.RequestID + "-tp", "TP"})
+		protective = append(protective, Order{now, request.Environment, request.Symbol, opposite(request.Side), "TAKE_PROFIT_MARKET", executedQuantity, value, "NEW_PAPER", request.RequestID + "-tp", "TP", true})
 	}
 	if request.StopLoss != nil && request.StopLoss.Enabled {
 		value := protectivePrice(price, request.Side, false, *request.StopLoss)
 		position.StopLoss = &value
-		protective = append(protective, Order{now, request.Environment, request.Symbol, opposite(request.Side), "STOP_MARKET", executedQuantity, value, "NEW_PAPER", request.RequestID + "-sl", "SL"})
+		protective = append(protective, Order{now, request.Environment, request.Symbol, opposite(request.Side), "STOP_MARKET", executedQuantity, value, "NEW_PAPER", request.RequestID + "-sl", "SL", true})
 	}
 	return order, position, protective
 }

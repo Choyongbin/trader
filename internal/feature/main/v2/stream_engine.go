@@ -210,7 +210,10 @@ func (e *StreamingEngine) Compute(decision, historyStart int64, v1row mainfeatur
 	lookbackReady := spotLookback && endpointReady(metrics5) && endpointReady(metrics15) && endpointReady(metrics60) && endpointReady(mark5) && endpointReady(index5) && endpointReady(premium5) && endpointReady(premium15) && fundingPrior != nil
 	result, evalErr := Evaluate(Input{DecisionTimestampMs: decision, Spot: spotState(e.spot, decision), Metrics: stateOf(metricsCurrent), Mark: stateOf(markCurrent), Index: stateOf(indexCurrent), Premium: stateOf(premiumCurrent), Funding: stateOf(fundingCurrent), WarmupReady: decision-historyStart >= RequiredWarmupMs, LookbackReady: lookbackReady, FeaturesFinite: AllFinite(v1...) && allNewFinite})
 	if evalErr != nil || !result.Eligible {
-		return Snapshot{}, result.Reason, evalErr
+		// Preserve the decision identity for diagnostics even when strict
+		// eligibility prevents feature emission. Values remain zero and are never
+		// evaluated by a model on this path.
+		return Snapshot{DecisionTimestampMs: decision}, result.Reason, evalErr
 	}
 	s := Snapshot{DecisionTimestampMs: decision}
 	copy(s.Values[:V1ModelFeatureCount], v1)

@@ -115,6 +115,30 @@ func TestAutoStateMachineReadyFixtureAndStop(t *testing.T) {
 	}
 }
 
+func TestStopDoesNotHideExistingOrUnknownAutomaticRisk(t *testing.T) {
+	for _, fixture := range []struct {
+		name, want string
+		owned      bool
+		unknown    bool
+	}{
+		{name: "protected", owned: true, want: "POSITION_PROTECTED_STOPPED"},
+		{name: "unknown", owned: true, unknown: true, want: "UNKNOWN_EXECUTION_STATE"},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			s := testServer(t)
+			s.mu.Lock()
+			s.states[TradingEnvironmentTestnet].AutoRunning = true
+			s.autoOwnedPosition = fixture.owned
+			s.autoRecoveryBlocked = fixture.unknown
+			s.mu.Unlock()
+			response := perform(s.Handler(), http.MethodPost, "/api/auto-trading/stop?environment=TESTNET", s.csrf, nil)
+			if response.Code != http.StatusOK || s.states[TradingEnvironmentTestnet].AutoState != fixture.want {
+				t.Fatalf("status=%d state=%s body=%s", response.Code, s.states[TradingEnvironmentTestnet].AutoState, response.Body.String())
+			}
+		})
+	}
+}
+
 func TestExecuteAutoIntentUsesDedicatedDemoAutoBackend(t *testing.T) {
 	t.Setenv("BINANCE_ENV", "TESTNET")
 	t.Setenv("BINANCE_TESTNET_ENABLE_ORDERS", "true")
@@ -170,13 +194,15 @@ func TestAutoOrderGateIsSeparateFromManualOrderGate(t *testing.T) {
 }
 
 type horizonBackend struct {
-	open       bool
-	closeCalls int
-	closeIDs   []string
-	closeSide  string
-	closeQty   float64
-	unrelated  bool
-	side       string
+	open          bool
+	closeCalls    int
+	closeIDs      []string
+	closeSide     string
+	closeQty      float64
+	unrelated     bool
+	side          string
+	failClose     bool
+	badProtective bool
 }
 
 func (b *horizonBackend) Refresh(context.Context) (Balance, []Position, []Order, error) {
@@ -193,7 +219,17 @@ func (b *horizonBackend) Refresh(context.Context) (Balance, []Position, []Order,
 		positionSide = "LONG"
 	}
 	position := Position{Environment: TradingEnvironmentTestnet, Symbol: "BTCUSDT", Side: positionSide, QuantityBTC: .001, EntryPrice: 100000, MarkPrice: 100000, Leverage: 1, MarginUSDT: 100}
-	orders := []Order{{Environment: TradingEnvironmentTestnet, Symbol: "BTCUSDT", ClientOrderID: "tp", Protective: "TP"}, {Environment: TradingEnvironmentTestnet, Symbol: "BTCUSDT", ClientOrderID: "sl", Protective: "SL"}}
+	protectiveSide := "SHORT"
+	if positionSide == "SHORT" {
+		protectiveSide = "LONG"
+	}
+	orders := []Order{
+		{Environment: TradingEnvironmentTestnet, Symbol: "BTCUSDT", Side: protectiveSide, OrderType: "TAKE_PROFIT_MARKET", QuantityBTC: .001, Price: 101000, Status: "NEW", ClientOrderID: "tp", Protective: "TP", ReduceOnly: true},
+		{Environment: TradingEnvironmentTestnet, Symbol: "BTCUSDT", Side: protectiveSide, OrderType: "STOP_MARKET", QuantityBTC: .001, Price: 99000, Status: "NEW", ClientOrderID: "sl", Protective: "SL", ReduceOnly: true},
+	}
+	if b.badProtective {
+		orders[0].ReduceOnly = false
+	}
 	if b.unrelated {
 		orders = append(orders, Order{ClientOrderID: "manual-algo"})
 	}
@@ -204,8 +240,36 @@ func (*horizonBackend) SubmitManual(context.Context, ManualOrderRequest) (Manual
 }
 func (b *horizonBackend) ClosePosition(context.Context, string) (binance.Order, error) {
 	b.closeCalls++
+	if b.failClose {
+		return binance.Order{}, errors.New("injected lost exit response")
+	}
 	b.open = false
 	return binance.Order{Status: "FILLED"}, nil
+}
+
+func TestUnknownHorizonExitIsNotResubmitted(t *testing.T) {
+	backend := &horizonBackend{open: true, failClose: true}
+	static := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("console")}}
+	s, err := NewServer(fakeProvider{credentials.CredentialStore{}}, static, Options{TestnetBackend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.autoOwnedPosition = true
+	s.autoProtectiveIDs = []string{"tp", "sl"}
+	s.autoExitDeadline = time.Now().Add(-time.Second)
+	s.autoCloseRequestID = "lost-exit"
+	s.autoExecutionState = &autoExecutionState{ExecutionState: "POSITION_PROTECTED", Symbol: "BTCUSDT", EntryClientOrderID: "entry", EntrySide: "LONG", EntryRequestedQuantity: .001, EntryNormalizedQuantity: "0.001", EntryFilledQuantity: .001, EntryFillTimestampMs: time.Now().UnixMilli(), TPClientAlgoID: "tp", SLClientAlgoID: "sl", TPTriggerPrice: 101000, SLTriggerPrice: 99000, ProtectiveQuantity: .001, HorizonSeconds: 900, HorizonDeadlineMs: time.Now().Add(-time.Second).UnixMilli(), HorizonCloseRequestID: "lost-exit"}
+	s.mu.Unlock()
+	if _, err = s.reconcileAutoLifecycle(context.Background()); err == nil || !s.autoRecoveryBlocked {
+		t.Fatalf("first reconcile err=%v blocked=%t", err, s.autoRecoveryBlocked)
+	}
+	if _, err = s.reconcileAutoLifecycle(context.Background()); err == nil {
+		t.Fatal("EXIT_PENDING retry did not remain unknown")
+	}
+	if backend.closeCalls != 1 {
+		t.Fatalf("duplicate exit calls=%d", backend.closeCalls)
+	}
 }
 func (b *horizonBackend) CloseAutoPosition(ctx context.Context, requestID string, ids []string, side string, quantity float64) (binance.Order, error) {
 	b.closeIDs = append([]string(nil), ids...)

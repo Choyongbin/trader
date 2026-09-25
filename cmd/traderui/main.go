@@ -23,6 +23,10 @@ var webFiles embed.FS
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:8080", "localhost listen address")
+	runDuration := flag.Duration("run-duration", 0, "optional bounded runtime duration")
+	warmupPath := flag.String("warmup-path", "", "optional isolated warmup status path")
+	liveSnapshotPath := flag.String("live-snapshot-path", "", "optional isolated live snapshot path")
+	autoStatePath := flag.String("auto-state-path", "", "optional isolated automatic execution state path")
 	audit := flag.Bool("audit", false, "run bounded UI checkpoint audit without serving")
 	auditFinalize := flag.Bool("audit-finalize", false, "mark build verification complete after commands pass")
 	opsReport := flag.Bool("ops-report", false, "write Phase UI-2/OPS-1 checkpoint report")
@@ -76,7 +80,7 @@ func main() {
 			testnet = backend
 		}
 	}
-	app, err := uiapi.NewServer(provider, static, uiapi.Options{ListenAddress: *listen, TestnetBackend: testnet, AutoPipeline: frozenPipeline, LiveFeatureRuntime: true, LiveBootstrap: true, BootstrapStabilization: 5 * time.Minute, PaperOrders: map[uiapi.TradingEnvironment]bool{
+	app, err := uiapi.NewServer(provider, static, uiapi.Options{ListenAddress: *listen, WarmupPath: *warmupPath, LiveSnapshotPath: *liveSnapshotPath, AutoExecutionStatePath: *autoStatePath, TestnetBackend: testnet, AutoPipeline: frozenPipeline, LiveFeatureRuntime: true, LiveBootstrap: true, BootstrapStabilization: 5 * time.Minute, PaperOrders: map[uiapi.TradingEnvironment]bool{
 		uiapi.TradingEnvironmentTestnet: false,
 		uiapi.TradingEnvironmentMainnet: false,
 	}})
@@ -85,6 +89,11 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if *runDuration > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *runDuration)
+		defer cancel()
+	}
 	app.RunPublicMarketFeed(ctx)
 	go app.RunAutoReconciliation(ctx)
 	server := &http.Server{Addr: *listen, Handler: app.Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}

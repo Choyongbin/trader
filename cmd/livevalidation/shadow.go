@@ -10,7 +10,9 @@ import (
 	"sort"
 	"time"
 
+	"binance_trader/internal/external/asof"
 	featurev2 "binance_trader/internal/feature/main/v2"
+	live "binance_trader/internal/live/binance"
 	"binance_trader/internal/model/logistic"
 )
 
@@ -65,25 +67,45 @@ func sha(path string) (string, error) {
 }
 
 type shadowMetrics struct {
-	DurationMs             int64   `json:"duration_ms"`
-	Decisions              int     `json:"decisions"`
-	Eligible               int     `json:"eligible"`
-	Excluded               int     `json:"excluded"`
-	NoTrade                int     `json:"NO_TRADE"`
-	Signals                int     `json:"signals"`
-	PaperEntries           int     `json:"paper_entries"`
-	PaperExits             int     `json:"paper_exits"`
-	Long                   int     `json:"LONG"`
-	Short                  int     `json:"SHORT"`
-	FutureObservation      int     `json:"future_observation"`
-	Errors                 int     `json:"errors"`
-	FeatureLatencyMeanUs   float64 `json:"feature_latency_mean_us"`
-	InferenceLatencyMeanUs float64 `json:"inference_latency_mean_us"`
-	PolicyLatencyMeanUs    float64 `json:"policy_latency_mean_us"`
-	OpenPositionAtEnd      bool    `json:"open_position_at_end"`
-	ModelEvaluations       int     `json:"model_evaluations"`
-	PaperIntents           int     `json:"paper_intents"`
-	BlockedEvents          int     `json:"blocked_events"`
+	DurationMs             int64           `json:"duration_ms"`
+	Decisions              int             `json:"decisions"`
+	Eligible               int             `json:"eligible"`
+	Excluded               int             `json:"excluded"`
+	NoTrade                int             `json:"NO_TRADE"`
+	Signals                int             `json:"signals"`
+	PaperEntries           int             `json:"paper_entries"`
+	PaperExits             int             `json:"paper_exits"`
+	Long                   int             `json:"LONG"`
+	Short                  int             `json:"SHORT"`
+	FutureObservation      int             `json:"future_observation"`
+	Errors                 int             `json:"errors"`
+	FeatureLatencyMeanUs   float64         `json:"feature_latency_mean_us"`
+	InferenceLatencyMeanUs float64         `json:"inference_latency_mean_us"`
+	PolicyLatencyMeanUs    float64         `json:"policy_latency_mean_us"`
+	OpenPositionAtEnd      bool            `json:"open_position_at_end"`
+	ModelEvaluations       int             `json:"model_evaluations"`
+	PaperIntents           int             `json:"paper_intents"`
+	BlockedEvents          int             `json:"blocked_events"`
+	ReasonCounts           map[string]int  `json:"exclusion_reason_counts"`
+	DecisionAudit          []decisionAudit `json:"decision_audit"`
+}
+
+type sourceAudit struct {
+	SourceTimestampMs  int64  `json:"source_timestamp_ms"`
+	ReceiveTimestampMs int64  `json:"receive_timestamp_ms"`
+	EffectiveAtMs      int64  `json:"effective_available_at_ms"`
+	AgeMs              int64  `json:"age_ms"`
+	FreshnessLimitMs   int64  `json:"freshness_limit_ms"`
+	Available          bool   `json:"available"`
+	Fresh              bool   `json:"fresh"`
+	Origin             string `json:"origin,omitempty"`
+}
+
+type decisionAudit struct {
+	DecisionTimestampMs int64                  `json:"decision_timestamp_ms"`
+	Reason              featurev2.Reason       `json:"reason"`
+	WarmupReady         bool                   `json:"warmup_ready"`
+	Sources             map[string]sourceAudit `json:"sources,omitempty"`
 }
 
 type liveShadowEvaluator struct {
@@ -110,6 +132,11 @@ func (e *liveShadowEvaluator) Decide(snapshot featurev2.Snapshot, reason feature
 		e.metrics.PaperExits++
 	}
 	if reason != featurev2.Eligible {
+		if e.metrics.ReasonCounts == nil {
+			e.metrics.ReasonCounts = make(map[string]int)
+		}
+		e.metrics.ReasonCounts[string(reason)]++
+		e.metrics.DecisionAudit = append(e.metrics.DecisionAudit, decisionAudit{DecisionTimestampMs: snapshot.DecisionTimestampMs, Reason: reason})
 		e.metrics.Excluded++
 		e.metrics.BlockedEvents++
 		if reason == featurev2.FutureObservation {
@@ -117,6 +144,7 @@ func (e *liveShadowEvaluator) Decide(snapshot featurev2.Snapshot, reason feature
 		}
 		return
 	}
+	e.metrics.DecisionAudit = append(e.metrics.DecisionAudit, decisionAudit{DecisionTimestampMs: snapshot.DecisionTimestampMs, Reason: reason})
 	e.metrics.Eligible++
 	start := time.Now()
 	selected := -1
@@ -149,6 +177,52 @@ func (e *liveShadowEvaluator) Decide(snapshot featurev2.Snapshot, reason feature
 	e.metrics.PaperIntents++
 	e.open = true
 	e.exitDeadline = snapshot.DecisionTimestampMs + int64(candidate.HorizonSeconds)*1000
+}
+
+func (e *liveShadowEvaluator) AttachSourceAudit(rows []live.ExternalObservation, historyStart int64) {
+	for i := range e.metrics.DecisionAudit {
+		d := &e.metrics.DecisionAudit[i]
+		d.WarmupReady = d.DecisionTimestampMs-historyStart >= featurev2.RequiredWarmupMs
+		d.Sources = make(map[string]sourceAudit)
+		for _, dataset := range []string{"metrics_oi", "metrics_global", "metrics_top_account", "metrics_top_position", "metrics_taker", "mark", "index", "premium", "funding"} {
+			d.Sources[dataset] = selectSourceAudit(rows, dataset, d.DecisionTimestampMs)
+		}
+	}
+}
+
+func selectSourceAudit(rows []live.ExternalObservation, dataset string, decision int64) sourceAudit {
+	limit := asof.MetricsMaxFreshAgeMs
+	if dataset == "mark" || dataset == "index" || dataset == "premium" {
+		limit = asof.KlineMaxFreshAgeMs
+	} else if dataset == "funding" {
+		limit = asof.FundingMaxFreshAgeMs
+	}
+	var best sourceAudit
+	for _, row := range rows {
+		if row.Dataset != dataset {
+			continue
+		}
+		effective := row.SourceTimestampMs + asof.ExternalSafetyLagMs
+		if dataset == "mark" || dataset == "index" || dataset == "premium" {
+			boundary := row.SourceTimestampMs + 60_000
+			if row.CloseTimeMs > 0 {
+				boundary = row.CloseTimeMs + 1
+			}
+			effective = boundary + asof.ExternalSafetyLagMs
+		}
+		if row.ReceiveTimestampMs > effective {
+			effective = row.ReceiveTimestampMs
+		}
+		if effective > decision || (best.Available && row.SourceTimestampMs < best.SourceTimestampMs) {
+			continue
+		}
+		age := decision - row.SourceTimestampMs
+		best = sourceAudit{SourceTimestampMs: row.SourceTimestampMs, ReceiveTimestampMs: row.ReceiveTimestampMs, EffectiveAtMs: effective, AgeMs: age, FreshnessLimitMs: limit, Available: true, Fresh: age <= limit, Origin: string(row.Origin)}
+	}
+	if !best.Available {
+		best.FreshnessLimitMs = limit
+	}
+	return best
 }
 
 func (e *liveShadowEvaluator) Result(duration time.Duration) shadowMetrics {

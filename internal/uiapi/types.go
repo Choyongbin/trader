@@ -91,6 +91,7 @@ type Order struct {
 	Status        string             `json:"status"`
 	ClientOrderID string             `json:"client_order_id"`
 	Protective    string             `json:"protective,omitempty"`
+	ReduceOnly    bool               `json:"reduce_only,omitempty"`
 }
 
 type Market struct {

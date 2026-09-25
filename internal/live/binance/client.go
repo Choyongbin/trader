@@ -172,9 +172,23 @@ func (c *Client) Signed(ctx context.Context, method, path string, values url.Val
 	return c.signed(ctx, method, path, values, out, true)
 }
 
+var authenticatedReadOnlyPaths = map[string]struct{}{
+	"/fapi/v1/algoOrder":         {},
+	"/fapi/v1/openAlgoOrders":    {},
+	"/fapi/v1/openOrders":        {},
+	"/fapi/v1/order":             {},
+	"/fapi/v1/positionSide/dual": {},
+	"/fapi/v2/balance":           {},
+	"/fapi/v2/positionRisk":      {},
+	"/fapi/v3/account":           {},
+}
+
 // UserData signs a read-only authenticated request. It can never submit,
 // modify, or cancel an order.
 func (c *Client) UserData(ctx context.Context, path string, values url.Values, out any) error {
+	if _, ok := authenticatedReadOnlyPaths[path]; !ok {
+		return fmt.Errorf("authenticated read-only endpoint rejected")
+	}
 	return c.signed(ctx, http.MethodGet, path, values, out, false)
 }
 

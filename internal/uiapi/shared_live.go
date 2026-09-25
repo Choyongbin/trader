@@ -83,7 +83,7 @@ func (s *Server) runSharedLiveRuntime(ctx context.Context) {
 			s.logLocked("Shared live runtime ready: " + result.StartupMode)
 			s.mu.Unlock()
 		}
-		_, err := livesession.Run(ctx, livesession.Options{Duration: 0, SnapshotPath: warmstate.RuntimeSnapshotPath, OnDecision: decision, OnStatus: status, OnEvent: s.consumeSharedLiveEvent, OnStarted: onStarted})
+		_, err := livesession.Run(ctx, livesession.Options{Duration: 0, SnapshotPath: s.liveSnapshotPath, OnDecision: decision, OnStatus: status, OnEvent: s.consumeSharedLiveEvent, OnStarted: onStarted})
 		if ctx.Err() != nil {
 			return
 		}

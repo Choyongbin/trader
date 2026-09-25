@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -109,6 +110,141 @@ func TestUserDataAllowedWhileOrdersRemainDisabled(t *testing.T) {
 	}
 	if err = c.Signed(context.Background(), http.MethodPost, "/fapi/v1/order", nil, nil); err == nil {
 		t.Fatal("trade request passed disabled order gate")
+	}
+}
+
+func TestOrderLookupAllowedWhileTradeGateIsOff(t *testing.T) {
+	oldEnv, oldEnabled := os.Getenv("BINANCE_ENV"), os.Getenv("BINANCE_TESTNET_ENABLE_ORDERS")
+	t.Cleanup(func() {
+		_ = os.Setenv("BINANCE_ENV", oldEnv)
+		_ = os.Setenv("BINANCE_TESTNET_ENABLE_ORDERS", oldEnabled)
+	})
+	_ = os.Setenv("BINANCE_ENV", "TESTNET")
+	_ = os.Setenv("BINANCE_TESTNET_ENABLE_ORDERS", "false")
+	c, err := NewTestnetClient("key", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := 0
+	c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		if r.Method != http.MethodGet || r.URL.Path != "/fapi/v1/order" || r.Header.Get("X-MBX-APIKEY") != "key" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL)
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"symbol":"BTCUSDT","clientOrderId":"owned"}`)), Header: make(http.Header)}, nil
+	})}
+	broker, err := NewBinanceTestnetBroker(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = broker.GetOrder(context.Background(), "BTCUSDT", "owned"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = broker.ReduceOnlyMarketExit(context.Background(), "BTCUSDT", "SELL", "0.001", "exit"); err == nil {
+		t.Fatal("trade command passed disabled gate")
+	}
+	if requests != 2 {
+		t.Fatalf("wire requests=%d", requests)
+	}
+}
+
+func TestUserDataRejectsEndpointOutsideExplicitAllowList(t *testing.T) {
+	c, err := NewTestnetClient("key", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = c.UserData(context.Background(), "/fapi/v1/leverage", nil, &struct{}{}); err == nil {
+		t.Fatal("non-allow-listed endpoint accepted")
+	}
+}
+
+func TestOrderLookupTimeoutWhileTradeGateIsOff(t *testing.T) {
+	t.Setenv("BINANCE_ENV", "TESTNET")
+	t.Setenv("BINANCE_TESTNET_ENABLE_ORDERS", "false")
+	c, err := NewTestnetClient("key", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := 0
+	c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		if r.Method != http.MethodGet || r.URL.Path != "/fapi/v1/order" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL)
+		}
+		<-r.Context().Done()
+		return nil, r.Context().Err()
+	})}
+	broker, err := NewBinanceTestnetBroker(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err = broker.GetOrder(ctx, "BTCUSDT", "owned"); err == nil {
+		t.Fatal("timed-out lookup unexpectedly succeeded")
+	}
+	if requests != 1 {
+		t.Fatalf("requests=%d", requests)
+	}
+}
+
+func TestHTTPResponseLossUsesReadOnlyLookupAfterTradeGateTurnsOff(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		postPath string
+		getBody  string
+		submit   func(*BinanceTestnetBroker) error
+	}{
+		{
+			name: "entry", postPath: "/fapi/v1/order",
+			getBody: `{"symbol":"BTCUSDT","side":"BUY","type":"MARKET","clientOrderId":"owned-entry","status":"FILLED","origQty":"0.001","executedQty":"0.001","avgPrice":"100000"}`,
+			submit: func(b *BinanceTestnetBroker) error {
+				_, err := b.MarketEntry(context.Background(), "BTCUSDT", "BUY", "0.001", "owned-entry")
+				return err
+			},
+		},
+		{
+			name: "protective", postPath: "/fapi/v1/algoOrder",
+			getBody: `{"symbol":"BTCUSDT","side":"SELL","orderType":"STOP_MARKET","clientAlgoId":"owned-sl","algoStatus":"NEW","quantity":"0.001","triggerPrice":"99000","reduceOnly":true}`,
+			submit: func(b *BinanceTestnetBroker) error {
+				_, err := b.ProtectiveStop(context.Background(), "BTCUSDT", "SELL", "0.001", "99000", "owned-sl")
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("BINANCE_ENV", "TESTNET")
+			t.Setenv("BINANCE_TESTNET_ENABLE_ORDERS", "true")
+			client, err := NewTestnetClient("key", "secret")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var calls []string
+			client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls = append(calls, r.Method+" "+r.URL.Path)
+				if r.Method == http.MethodPost {
+					if r.URL.Path != test.postPath {
+						t.Fatalf("post path=%s", r.URL.Path)
+					}
+					_ = os.Setenv("BINANCE_TESTNET_ENABLE_ORDERS", "false")
+					return nil, context.DeadlineExceeded
+				}
+				if r.Method != http.MethodGet || r.URL.Path != test.postPath {
+					t.Fatalf("lookup=%s %s", r.Method, r.URL.Path)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(test.getBody)), Header: make(http.Header)}, nil
+			})}
+			broker, err := NewBinanceTestnetBroker(client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = test.submit(broker); err != nil {
+				t.Fatal(err)
+			}
+			if len(calls) != 2 || !strings.HasPrefix(calls[0], "POST ") || !strings.HasPrefix(calls[1], "GET ") {
+				t.Fatalf("calls=%v", calls)
+			}
+		})
 	}
 }
 

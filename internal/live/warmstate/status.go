@@ -30,6 +30,8 @@ type Status struct {
 	LastEventTimeMs            int64          `json:"last_event_time_ms"`
 	LastReceiveTimeMs          int64          `json:"last_receive_time_ms"`
 	FutureObservations         int64          `json:"future_observations"`
+	RuntimeResets              int64          `json:"runtime_reset_count,omitempty"`
+	LastResetReason            string         `json:"last_reset_reason,omitempty"`
 	Source                     string         `json:"source,omitempty"`
 	BootstrapState             string         `json:"bootstrap_state,omitempty"`
 	BootstrapReady             bool           `json:"bootstrap_ready"`

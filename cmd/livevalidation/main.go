@@ -43,6 +43,7 @@ func main() {
 	resume := flag.Bool("resume", false, "resume persistent warmup capture")
 	bootstrapLookback := flag.Duration("bootstrap-lookback", 4*time.Hour+30*time.Minute, "recent public bootstrap lookback")
 	stabilization := flag.Duration("stabilization", 5*time.Minute, "live handoff stabilization target")
+	snapshotPath := flag.String("snapshot-path", filepath.FromSlash(warmstate.RuntimeSnapshotPath), "isolated runtime snapshot path")
 	flag.Parse()
 	if *legacyDuration > 0 {
 		*duration = *legacyDuration
@@ -53,7 +54,7 @@ func main() {
 	if e := os.MkdirAll(*root, 0755); e != nil {
 		fatal(e)
 	}
-	runs := map[string]func(string) error{"stage-a": runA, "stage-b": func(p string) error { return runB(p, *duration) }, "stage-c": runC, "stage-d": runD, "stage-e": runE, "stage-f": runF, "stage-g": func(p string) error { return runG(p, *duration) }, "final": runFinal,
+	runs := map[string]func(string) error{"stage-a": runA, "stage-b": func(p string) error { return runB(p, *duration) }, "stage-c": runC, "stage-d": runD, "stage-e": runE, "stage-f": runF, "stage-g": func(p string) error { return runG(p, *duration, *snapshotPath) }, "final": runFinal,
 		"bootstrap":          func(string) error { return runRecentBootstrap(*bootstrapLookback, *stabilization) },
 		"bootstrap-finalize": func(string) error { return finalizeRecentBootstrap() },
 		"warmup-capture": func(string) error {
@@ -377,14 +378,17 @@ func runF(path string) error {
 	return nil
 }
 
-func runG(path string, duration time.Duration) error {
+func runG(path string, duration time.Duration, snapshotPath string) error {
 	evaluator, e := newLiveShadowEvaluator()
 	if e != nil {
 		return e
 	}
-	liveResult, e := livesession.Run(context.Background(), livesession.Options{Duration: duration, SnapshotPath: filepath.FromSlash(warmstate.RuntimeSnapshotPath), OnDecision: evaluator.Decide})
+	liveResult, e := livesession.Run(context.Background(), livesession.Options{Duration: duration, SnapshotPath: snapshotPath, OnDecision: evaluator.Decide})
 	if e != nil {
 		return e
+	}
+	if snapshot, loadErr := warmstate.Load(snapshotPath); loadErr == nil && len(snapshot.Futures) > 0 {
+		evaluator.AttachSourceAudit(snapshot.External, snapshot.Futures[0].TimestampMs)
 	}
 	shadow := evaluator.Result(time.Duration(liveResult.LiveDurationMs) * time.Millisecond)
 	complete := liveResult.LiveDurationMs >= duration.Milliseconds()-2000 && liveResult.FuturesMessages > 0 && liveResult.SpotMessages > 0 && liveResult.ExternalUpdates > 0 && liveResult.FuturesBars > 0 && liveResult.SpotBars > 0 && liveResult.FeatureDecisions > 0 && shadow.ModelEvaluations > 0 && liveResult.FutureObservations == 0 && liveResult.ReverseEvents == 0 && liveResult.IDGaps == 0
@@ -392,7 +396,7 @@ func runG(path string, duration time.Duration) error {
 	if complete {
 		status = "PASS"
 	}
-	r := map[string]any{"Version": 4, "Status": status, "Complete": complete, "mode": "SELF_CONTAINED_LIVE_SHADOW", "execution": "RecordingPaperBroker", "live_orders_sent": false, "actual_order_submits": 0, "startup_mode": liveResult.StartupMode, "startup_ms": liveResult.StartupMs, "snapshot_restored": liveResult.SnapshotRestored, "full_bootstrap_executed": liveResult.FullBootstrap, "catchup_events": liveResult.CatchupEvents, "restore_attempted": liveResult.RestoreAttempted, "restore_applied": liveResult.RestoreApplied, "restore_rejected": liveResult.RestoreRejected, "restore_reject_reason": liveResult.RestoreRejectReason, "restore_expected_futures_id": liveResult.RestoreExpectedFuturesID, "restore_actual_futures_id": liveResult.RestoreActualFuturesID, "restore_expected_spot_id": liveResult.RestoreExpectedSpotID, "restore_actual_spot_id": liveResult.RestoreActualSpotID, "restore_snapshot_last_event_ms": liveResult.RestoreSnapshotLastEventMs, "restore_actual_futures_ms": liveResult.RestoreActualFuturesMs, "restore_actual_spot_ms": liveResult.RestoreActualSpotMs, "duration_ms": liveResult.LiveDurationMs, "requested_duration_ms": duration.Milliseconds(), "futures_messages": liveResult.FuturesMessages, "spot_messages": liveResult.SpotMessages, "external_updates": liveResult.ExternalUpdates, "futures_bars": liveResult.FuturesBars, "spot_bars": liveResult.SpotBars, "feature_decisions": liveResult.FeatureDecisions, "eligible_decisions": liveResult.EligibleDecisions, "future_observations": liveResult.FutureObservations, "duplicate_events": liveResult.DuplicateEvents, "reverse_events": liveResult.ReverseEvents, "canonical_id_gaps": liveResult.IDGaps, "metrics": shadow, "feature_registry_hash": featureRegistryHash, "entry_policy_hash": entryPolicyHash, "risk_policy_hash": riskPolicyHash, "startup_hash_validation": "PASS", "frozen_candidate_models": len(evaluator.models), "policy_candidates": len(evaluator.policy.Candidates), "runtime_snapshot": warmstate.RuntimeSnapshotPath, "resume_command": fmt.Sprintf("$env:BINANCE_ENV='PUBLIC_ONLY'; go run ./cmd/livevalidation -mode stage-g -duration %s -resume", duration.String()), "demo_actual_orders": 0, "mainnet_private_calls": 0, "mainnet_orders": 0, "FinalHoldoutAccessed": false}
+	r := map[string]any{"Version": 4, "Status": status, "Complete": complete, "mode": "SELF_CONTAINED_LIVE_SHADOW", "execution": "RecordingPaperBroker", "live_orders_sent": false, "actual_order_submits": 0, "startup_mode": liveResult.StartupMode, "startup_ms": liveResult.StartupMs, "snapshot_restored": liveResult.SnapshotRestored, "full_bootstrap_executed": liveResult.FullBootstrap, "catchup_events": liveResult.CatchupEvents, "restore_attempted": liveResult.RestoreAttempted, "restore_applied": liveResult.RestoreApplied, "restore_rejected": liveResult.RestoreRejected, "restore_reject_reason": liveResult.RestoreRejectReason, "restore_expected_futures_id": liveResult.RestoreExpectedFuturesID, "restore_actual_futures_id": liveResult.RestoreActualFuturesID, "restore_expected_spot_id": liveResult.RestoreExpectedSpotID, "restore_actual_spot_id": liveResult.RestoreActualSpotID, "restore_snapshot_last_event_ms": liveResult.RestoreSnapshotLastEventMs, "restore_actual_futures_ms": liveResult.RestoreActualFuturesMs, "restore_actual_spot_ms": liveResult.RestoreActualSpotMs, "duration_ms": liveResult.LiveDurationMs, "requested_duration_ms": duration.Milliseconds(), "futures_messages": liveResult.FuturesMessages, "spot_messages": liveResult.SpotMessages, "external_updates": liveResult.ExternalUpdates, "futures_bars": liveResult.FuturesBars, "spot_bars": liveResult.SpotBars, "feature_decisions": liveResult.FeatureDecisions, "eligible_decisions": liveResult.EligibleDecisions, "future_observations": liveResult.FutureObservations, "duplicate_events": liveResult.DuplicateEvents, "reverse_events": liveResult.ReverseEvents, "canonical_id_gaps": liveResult.IDGaps, "metrics": shadow, "warmup_status": liveResult.FinalStatus.Status, "source_last_ms": liveResult.FinalStatus.SourceLastMs, "metric_sources": liveResult.FinalStatus.MetricSources, "feature_registry_hash": featureRegistryHash, "entry_policy_hash": entryPolicyHash, "risk_policy_hash": riskPolicyHash, "startup_hash_validation": "PASS", "frozen_candidate_models": len(evaluator.models), "policy_candidates": len(evaluator.policy.Candidates), "runtime_snapshot": snapshotPath, "resume_command": fmt.Sprintf("$env:BINANCE_ENV='PUBLIC_ONLY'; go run ./cmd/livevalidation -mode stage-g -duration %s -snapshot-path %q", duration.String(), snapshotPath), "demo_actual_orders": 0, "mainnet_private_calls": 0, "mainnet_orders": 0, "FinalHoldoutAccessed": false}
 	if e = durable(path, r); e != nil {
 		return e
 	}

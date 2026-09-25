@@ -2,6 +2,7 @@ package uiapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -32,14 +33,50 @@ type AutoTestnetBackend interface {
 	CleanupAutoProtective(context.Context, []string) error
 }
 
+type preparedAutoTestnetBackend interface {
+	AutoTestnetBackend
+	PrepareAuto(context.Context, autopipeline.ExecutionIntent) (autoSubmissionPlan, error)
+	SubmitPreparedAuto(context.Context, autoSubmissionPlan) (ManualExecution, error)
+}
+
 type AutoPositionCloser interface {
 	CloseAutoPosition(context.Context, string, []string, string, float64) (binance.Order, error)
 }
 
-type BinanceTestnetBackend struct {
-	client *binance.Client
-	broker *binance.BinanceTestnetBroker
+type testnetClient interface {
+	SyncTime(context.Context) (int64, error)
+	Account(context.Context) (binance.Account, error)
+	Positions(context.Context, string) ([]binance.PositionV3, error)
+	OpenOrders(context.Context, string) ([]binance.Order, error)
+	OpenAlgoOrders(context.Context, string) ([]binance.AlgoOrder, error)
+	PositionMode(context.Context) (binance.PositionMode, error)
+	ExchangeSymbol(context.Context, string) (binance.Symbol, int64, error)
+	MarkPrice(context.Context, string) (float64, error)
 }
+
+type testnetBroker interface {
+	SetLeverage(context.Context, string, int) error
+	MarketEntry(context.Context, string, string, string, string) (binance.Order, error)
+	ReduceOnlyMarketExit(context.Context, string, string, string, string) (binance.Order, error)
+	ProtectiveStop(context.Context, string, string, string, string, string) (binance.Order, error)
+	TakeProfit(context.Context, string, string, string, string, string) (binance.Order, error)
+	CancelAlgo(context.Context, string) (binance.AlgoOrder, error)
+	GetOrder(context.Context, string, string) (binance.Order, error)
+}
+
+type BinanceTestnetBackend struct {
+	client              testnetClient
+	broker              testnetBroker
+	autoRecoveryTimeout time.Duration
+}
+
+var (
+	errAutoCleanupConfirmed  = errors.New("AUTO_CLEANUP_CONFIRMED")
+	errUnknownExecutionState = errors.New("UNKNOWN_EXECUTION_STATE")
+	errAutoEntryNotSubmitted = errors.New("AUTO_ENTRY_NOT_SUBMITTED")
+)
+
+const defaultAutoFailureRecoveryTimeout = 12 * time.Second
 
 func NewBinanceTestnetBackend(apiKey, secret string) (*BinanceTestnetBackend, error) {
 	client, err := binance.NewTestnetClient(apiKey, secret)
@@ -161,7 +198,7 @@ func (b *BinanceTestnetBackend) Refresh(ctx context.Context) (Balance, []Positio
 		if raw.OrderType == "TAKE_PROFIT_MARKET" {
 			protective = "TP"
 		}
-		orders = append(orders, Order{Time: time.UnixMilli(raw.CreateTime).UTC(), Environment: TradingEnvironmentTestnet, Symbol: raw.Symbol, Side: exchangeSide(raw.Side), OrderType: raw.OrderType, QuantityBTC: qty, Price: price, Status: raw.AlgoStatus, ClientOrderID: raw.ClientAlgoID, Protective: protective})
+		orders = append(orders, Order{Time: time.UnixMilli(raw.CreateTime).UTC(), Environment: TradingEnvironmentTestnet, Symbol: raw.Symbol, Side: exchangeSide(raw.Side), OrderType: raw.OrderType, QuantityBTC: qty, Price: price, Status: raw.AlgoStatus, ClientOrderID: raw.ClientAlgoID, Protective: protective, ReduceOnly: raw.ReduceOnly})
 	}
 	return resultBalance, positions, orders, nil
 }
@@ -178,7 +215,13 @@ func uiOrder(raw binance.Order, protective string) Order {
 	if price == 0 && protective != "" {
 		price, _ = strconv.ParseFloat(raw.StopPrice, 64)
 	}
-	return Order{Time: time.Now().UTC(), Environment: TradingEnvironmentTestnet, Symbol: raw.Symbol, Side: exchangeSide(raw.Side), OrderType: raw.Type, QuantityBTC: qty, Price: price, Status: raw.Status, ClientOrderID: raw.ClientOrderID, Protective: protective}
+	orderTime := time.Now().UTC()
+	if raw.UpdateTime > 0 {
+		orderTime = time.UnixMilli(raw.UpdateTime).UTC()
+	} else if raw.Time > 0 {
+		orderTime = time.UnixMilli(raw.Time).UTC()
+	}
+	return Order{Time: orderTime, Environment: TradingEnvironmentTestnet, Symbol: raw.Symbol, Side: exchangeSide(raw.Side), OrderType: raw.Type, QuantityBTC: qty, Price: price, Status: raw.Status, ClientOrderID: raw.ClientOrderID, Protective: protective, ReduceOnly: raw.ReduceOnly}
 }
 
 func exchangeSide(side string) string {
@@ -246,7 +289,7 @@ func (b *BinanceTestnetBackend) SubmitManual(ctx context.Context, request Manual
 	}
 	entry, err := b.broker.MarketEntry(ctx, request.Symbol, entrySide, quantityText, request.RequestID)
 	if err != nil {
-		cleanupErr := b.cleanupIfOpen(ctx, request.RequestID+"-uncertain-cleanup")
+		cleanupErr := b.cleanupManualIfOpen(ctx, request.RequestID+"-uncertain-cleanup")
 		if cleanupErr != nil {
 			return ManualExecution{}, fmt.Errorf("entry state uncertain and cleanup failed: %v / %v", err, cleanupErr)
 		}
@@ -255,7 +298,7 @@ func (b *BinanceTestnetBackend) SubmitManual(ctx context.Context, request Manual
 	if entry.ExecutedQuantity == "" || entry.AveragePrice == "" || entry.AveragePrice == "0" {
 		queried, queryErr := b.broker.GetOrder(ctx, request.Symbol, request.RequestID)
 		if queryErr != nil {
-			cleanupErr := b.cleanupIfOpen(ctx, request.RequestID+"-query-cleanup")
+			cleanupErr := b.cleanupManualIfOpen(ctx, request.RequestID+"-query-cleanup")
 			if cleanupErr != nil {
 				return ManualExecution{}, fmt.Errorf("entry fill query failed and cleanup failed: %v / %v", queryErr, cleanupErr)
 			}
@@ -265,7 +308,7 @@ func (b *BinanceTestnetBackend) SubmitManual(ctx context.Context, request Manual
 	}
 	executed, err := parseNumber("executed quantity", entry.ExecutedQuantity)
 	if err != nil || executed <= 0 {
-		cleanupErr := b.cleanupIfOpen(ctx, request.RequestID+"-fill-cleanup")
+		cleanupErr := b.cleanupManualIfOpen(ctx, request.RequestID+"-fill-cleanup")
 		if cleanupErr != nil {
 			return ManualExecution{}, fmt.Errorf("entry fill quantity unavailable and cleanup failed: %v", cleanupErr)
 		}
@@ -273,7 +316,7 @@ func (b *BinanceTestnetBackend) SubmitManual(ctx context.Context, request Manual
 	}
 	fill, err := parseNumber("average fill price", entry.AveragePrice)
 	if err != nil || fill <= 0 {
-		cleanupErr := b.cleanupIfOpen(ctx, request.RequestID+"-price-cleanup")
+		cleanupErr := b.cleanupManualIfOpen(ctx, request.RequestID+"-price-cleanup")
 		if cleanupErr != nil {
 			return ManualExecution{}, fmt.Errorf("entry fill price unavailable and cleanup failed: %v", cleanupErr)
 		}
@@ -318,14 +361,14 @@ func (b *BinanceTestnetBackend) SubmitManual(ctx context.Context, request Manual
 		return nil
 	}
 	if err = create(request.TakeProfit, true); err != nil {
-		cleanupErr := b.cleanupOwnedPosition(ctx, request.RequestID+"-cleanup")
+		cleanupErr := b.cleanupManualOwnedPosition(ctx, request.RequestID+"-cleanup")
 		if cleanupErr != nil {
 			return ManualExecution{}, fmt.Errorf("TP creation failed and cleanup failed: %v / %v", err, cleanupErr)
 		}
 		return ManualExecution{}, fmt.Errorf("TP creation failed; entry cleaned up: %w", err)
 	}
 	if err = create(request.StopLoss, false); err != nil {
-		cleanupErr := b.cleanupOwnedPosition(ctx, request.RequestID+"-cleanup")
+		cleanupErr := b.cleanupManualOwnedPosition(ctx, request.RequestID+"-cleanup")
 		if cleanupErr != nil {
 			return ManualExecution{}, fmt.Errorf("SL creation failed and cleanup failed: %v / %v", err, cleanupErr)
 		}
@@ -333,7 +376,7 @@ func (b *BinanceTestnetBackend) SubmitManual(ctx context.Context, request Manual
 	}
 	_, refreshed, _, err := b.Refresh(ctx)
 	if err != nil || len(refreshed) != 1 {
-		cleanupErr := b.cleanupIfOpen(ctx, request.RequestID+"-verify-cleanup")
+		cleanupErr := b.cleanupManualIfOpen(ctx, request.RequestID+"-verify-cleanup")
 		if cleanupErr != nil {
 			return ManualExecution{}, fmt.Errorf("position verification failed and cleanup failed: %v", cleanupErr)
 		}
@@ -373,50 +416,69 @@ func validAutoIntent(intent autopipeline.ExecutionIntent) error {
 	return nil
 }
 
-// SubmitAuto executes one frozen-policy ExecutionIntent on Binance Futures Demo.
-// It reuses the same conservative exchange gates as manual execution, rounds the
-// quantity down so current mark-price movement cannot increase the requested
-// frozen-policy notional, and rebases TP/SL ratios to the actual average fill.
-func (b *BinanceTestnetBackend) SubmitAuto(ctx context.Context, intent autopipeline.ExecutionIntent) (ManualExecution, error) {
-	if err := validAutoIntent(intent); err != nil {
-		return ManualExecution{}, err
-	}
+type autoSubmissionPlan struct {
+	intent       autopipeline.ExecutionIntent
+	symbol       binance.Symbol
+	quantity     float64
+	quantityText string
+	entrySide    string
+	entryID      string
+	tpID         string
+	slID         string
+}
+
+func (b *BinanceTestnetBackend) verifyAutoExchangeFlat(ctx context.Context, symbol string) error {
 	mode, err := b.client.PositionMode(ctx)
 	if err != nil {
-		return ManualExecution{}, err
+		return err
 	}
 	if mode.DualSidePosition {
-		return ManualExecution{}, fmt.Errorf("Hedge Mode is not supported by this safety path")
+		return fmt.Errorf("Hedge Mode is not supported by this safety path")
 	}
-	positionsRaw, err := b.client.Positions(ctx, intent.Symbol)
+	positions, err := b.client.Positions(ctx, symbol)
 	if err != nil {
-		return ManualExecution{}, err
+		return err
 	}
-	normalOrders, err := b.client.OpenOrders(ctx, intent.Symbol)
+	normalOrders, err := b.client.OpenOrders(ctx, symbol)
 	if err != nil {
-		return ManualExecution{}, err
+		return err
 	}
-	algoOrders, err := b.client.OpenAlgoOrders(ctx, intent.Symbol)
+	algoOrders, err := b.client.OpenAlgoOrders(ctx, symbol)
 	if err != nil {
-		return ManualExecution{}, err
+		return err
 	}
-	for _, p := range positionsRaw {
-		q, _ := strconv.ParseFloat(p.PositionAmount, 64)
-		if q != 0 {
-			return ManualExecution{}, fmt.Errorf("existing position or open order safety gate")
+	for _, position := range positions {
+		quantity, parseErr := strconv.ParseFloat(position.PositionAmount, 64)
+		if parseErr != nil || math.IsNaN(quantity) || math.IsInf(quantity, 0) || quantity != 0 {
+			return fmt.Errorf("existing or invalid position safety gate")
 		}
 	}
 	if len(normalOrders) != 0 || len(algoOrders) != 0 {
-		return ManualExecution{}, fmt.Errorf("existing position or open order safety gate")
+		return fmt.Errorf("existing position or open order safety gate")
 	}
+	return nil
+}
 
+// PrepareAuto performs only read-only validation and normalization. Its result
+// is persisted by Server before SubmitPreparedAuto may cause an exchange side
+// effect.
+func (b *BinanceTestnetBackend) PrepareAuto(ctx context.Context, intent autopipeline.ExecutionIntent) (autoSubmissionPlan, error) {
+	notSubmitted := func(err error) (autoSubmissionPlan, error) {
+		return autoSubmissionPlan{}, fmt.Errorf("%w: %v", errAutoEntryNotSubmitted, err)
+	}
+	if err := validAutoIntent(intent); err != nil {
+		return notSubmitted(err)
+	}
+	if err := b.verifyAutoExchangeFlat(ctx, intent.Symbol); err != nil {
+		return notSubmitted(err)
+	}
 	symbol, _, err := b.client.ExchangeSymbol(ctx, intent.Symbol)
 	if err != nil {
-		return ManualExecution{}, err
+		return notSubmitted(err)
 	}
 	mark, err := b.client.MarkPrice(ctx, intent.Symbol)
 	if err != nil {
-		return ManualExecution{}, err
+		return notSubmitted(err)
 	}
 	requestedQty := intent.QuantityBTC
 	if maxByCurrentMark := intent.NotionalUSDT / mark; maxByCurrentMark < requestedQty {
@@ -424,131 +486,318 @@ func (b *BinanceTestnetBackend) SubmitAuto(ctx context.Context, intent autopipel
 	}
 	quantity, err := binance.NormalizeQuantity(symbol, requestedQty, true)
 	if err != nil {
-		return ManualExecution{}, err
+		return notSubmitted(err)
 	}
 	if err = binance.ValidateMinNotional(symbol, mark, quantity); err != nil {
-		return ManualExecution{}, err
+		return notSubmitted(err)
 	}
 	quantityText, err := binance.FormatQuantity(symbol, quantity, true)
 	if err != nil {
-		return ManualExecution{}, err
+		return notSubmitted(err)
 	}
-	if err = b.broker.SetLeverage(ctx, intent.Symbol, intent.Leverage); err != nil {
-		return ManualExecution{}, err
-	}
-
 	entrySide := "BUY"
 	if intent.Side == "SHORT" {
 		entrySide = "SELL"
 	}
-	entryID := binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "entry", 0)
+	return autoSubmissionPlan{
+		intent: intent, symbol: symbol, quantity: quantity, quantityText: quantityText, entrySide: entrySide,
+		entryID: binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "entry", 0),
+		tpID:    binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "tp", 0),
+		slID:    binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "sl", 0),
+	}, nil
+}
+
+// SubmitAuto executes one frozen-policy ExecutionIntent on Binance Futures Demo.
+// It reuses the same conservative exchange gates as manual execution, rounds the
+// quantity down so current mark-price movement cannot increase the requested
+// frozen-policy notional, and rebases TP/SL ratios to the actual average fill.
+func (b *BinanceTestnetBackend) SubmitAuto(ctx context.Context, intent autopipeline.ExecutionIntent) (ManualExecution, error) {
+	plan, err := b.PrepareAuto(ctx, intent)
+	if err != nil {
+		return ManualExecution{}, err
+	}
+	return b.SubmitPreparedAuto(ctx, plan)
+}
+
+func (b *BinanceTestnetBackend) SubmitPreparedAuto(ctx context.Context, plan autoSubmissionPlan) (ManualExecution, error) {
+	intent, symbol := plan.intent, plan.symbol
+	quantityText, entrySide := plan.quantityText, plan.entrySide
+	entryID, tpID, slID := plan.entryID, plan.tpID, plan.slID
+	if err := b.verifyAutoExchangeFlat(ctx, intent.Symbol); err != nil {
+		return ManualExecution{}, fmt.Errorf("%w: %v", errAutoEntryNotSubmitted, err)
+	}
+	if err := b.broker.SetLeverage(ctx, intent.Symbol, intent.Leverage); err != nil {
+		return ManualExecution{}, fmt.Errorf("%w: %v", errAutoEntryNotSubmitted, err)
+	}
+	ownership := autoCleanupOwnership{symbol: intent.Symbol, side: intent.Side, requestedQuantity: quantityText, entryID: entryID, tpID: tpID, slID: slID, decisionTimestampMs: intent.DecisionTimestampMs, candidateID: intent.CandidateID}
 	entry, err := b.broker.MarketEntry(ctx, intent.Symbol, entrySide, quantityText, entryID)
 	if err != nil {
-		cleanupErr := b.cleanupIfOpen(ctx, binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "uncertain-cleanup", 0))
-		if cleanupErr != nil {
-			return ManualExecution{}, fmt.Errorf("auto entry state uncertain and cleanup failed: %v / %v", err, cleanupErr)
-		}
-		return ManualExecution{}, err
+		return ManualExecution{}, b.cleanupFailedAutoExecution(ctx, ownership, err)
 	}
 	if entry.ExecutedQuantity == "" || entry.AveragePrice == "" || entry.AveragePrice == "0" {
 		queried, queryErr := b.broker.GetOrder(ctx, intent.Symbol, entryID)
 		if queryErr != nil {
-			cleanupErr := b.cleanupIfOpen(ctx, binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "query-cleanup", 0))
-			if cleanupErr != nil {
-				return ManualExecution{}, fmt.Errorf("auto entry fill query failed and cleanup failed: %v / %v", queryErr, cleanupErr)
-			}
-			return ManualExecution{}, fmt.Errorf("auto entry fill query failed; exchange reconciled: %w", queryErr)
+			return ManualExecution{}, b.cleanupFailedAutoExecution(ctx, ownership, fmt.Errorf("auto entry fill query failed: %w", queryErr))
 		}
 		entry = queried
 	}
+	if entry.ClientOrderID != entryID || entry.Symbol != intent.Symbol || entry.Side != entrySide || entry.Type != "MARKET" || entry.Status != "FILLED" || entry.OriginalQuantity != quantityText {
+		return ManualExecution{}, b.cleanupFailedAutoExecution(ctx, ownership, fmt.Errorf("auto entry identity or fill status mismatch"))
+	}
+	if entry.UpdateTime <= 0 && entry.Time <= 0 {
+		return ManualExecution{}, b.cleanupFailedAutoExecution(ctx, ownership, fmt.Errorf("auto entry fill timestamp unavailable"))
+	}
 	executed, err := parseNumber("executed quantity", entry.ExecutedQuantity)
 	if err != nil || executed <= 0 {
-		cleanupErr := b.cleanupIfOpen(ctx, binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "fill-cleanup", 0))
-		if cleanupErr != nil {
-			return ManualExecution{}, fmt.Errorf("auto entry fill quantity unavailable and cleanup failed: %v", cleanupErr)
-		}
-		return ManualExecution{}, fmt.Errorf("auto entry fill quantity unavailable; exchange reconciled")
+		return ManualExecution{}, b.cleanupFailedAutoExecution(ctx, ownership, fmt.Errorf("auto entry fill quantity unavailable"))
 	}
 	fill, err := parseNumber("average fill price", entry.AveragePrice)
 	if err != nil || fill <= 0 {
-		cleanupErr := b.cleanupIfOpen(ctx, binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "price-cleanup", 0))
-		if cleanupErr != nil {
-			return ManualExecution{}, fmt.Errorf("auto entry fill price unavailable and cleanup failed: %v", cleanupErr)
-		}
-		return ManualExecution{}, fmt.Errorf("auto entry fill price unavailable; exchange reconciled")
+		return ManualExecution{}, b.cleanupFailedAutoExecution(ctx, ownership, fmt.Errorf("auto entry fill price unavailable"))
 	}
 
-	cleanupAfterEntry := func(label string, cause error) (ManualExecution, error) {
-		cleanupID := binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, label, 0)
-		cleanupErr := b.cleanupOwnedPosition(ctx, cleanupID)
-		if cleanupErr != nil {
-			return ManualExecution{}, fmt.Errorf("%v and cleanup failed: %v", cause, cleanupErr)
-		}
-		return ManualExecution{}, fmt.Errorf("%w; entry cleaned up", cause)
+	cleanupAfterEntry := func(cause error) (ManualExecution, error) {
+		return ManualExecution{}, b.cleanupFailedAutoExecution(ctx, ownership, cause)
 	}
 	executedText, err := binance.FormatQuantity(symbol, executed, true)
 	if err != nil {
-		return cleanupAfterEntry("quantity-format-cleanup", fmt.Errorf("auto executed quantity format failed: %w", err))
+		return cleanupAfterEntry(fmt.Errorf("auto executed quantity format failed: %w", err))
 	}
 	tp, err := binance.NormalizePrice(symbol, fill*(intent.TPPrice/intent.EntryReferencePrice))
 	if err != nil {
-		return cleanupAfterEntry("tp-normalize-cleanup", fmt.Errorf("auto TP normalization failed: %w", err))
+		return cleanupAfterEntry(fmt.Errorf("auto TP normalization failed: %w", err))
 	}
 	sl, err := binance.NormalizePrice(symbol, fill*(intent.SLPrice/intent.EntryReferencePrice))
 	if err != nil {
-		return cleanupAfterEntry("sl-normalize-cleanup", fmt.Errorf("auto SL normalization failed: %w", err))
+		return cleanupAfterEntry(fmt.Errorf("auto SL normalization failed: %w", err))
 	}
 	if intent.Side == "LONG" && !(tp > fill && sl < fill) || intent.Side == "SHORT" && !(tp < fill && sl > fill) {
-		cleanupErr := b.cleanupOwnedPosition(ctx, binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "protective-price-cleanup", 0))
-		if cleanupErr != nil {
-			return ManualExecution{}, fmt.Errorf("auto protective price invalid and cleanup failed: %v", cleanupErr)
-		}
-		return ManualExecution{}, fmt.Errorf("auto protective price invalid; entry cleaned up")
+		return ManualExecution{}, b.cleanupFailedAutoExecution(ctx, ownership, fmt.Errorf("auto protective price invalid"))
 	}
 	tpText, err := binance.FormatPrice(symbol, tp)
 	if err != nil {
-		return cleanupAfterEntry("tp-format-cleanup", fmt.Errorf("auto TP format failed: %w", err))
+		return cleanupAfterEntry(fmt.Errorf("auto TP format failed: %w", err))
 	}
 	slText, err := binance.FormatPrice(symbol, sl)
 	if err != nil {
-		return cleanupAfterEntry("sl-format-cleanup", fmt.Errorf("auto SL format failed: %w", err))
+		return cleanupAfterEntry(fmt.Errorf("auto SL format failed: %w", err))
 	}
 	oppositeSide := "SELL"
 	if intent.Side == "SHORT" {
 		oppositeSide = "BUY"
 	}
-	tpID := binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "tp", 0)
-	slID := binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "sl", 0)
+	ownership.protectiveSide = oppositeSide
+	ownership.protectiveQuantity = executedText
+	ownership.tpTrigger = tpText
+	ownership.slTrigger = slText
 	placedTP, err := b.broker.TakeProfit(ctx, intent.Symbol, oppositeSide, executedText, tpText, tpID)
 	if err != nil {
-		cleanupErr := b.cleanupOwnedPosition(ctx, binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "tp-cleanup", 0))
-		if cleanupErr != nil {
-			return ManualExecution{}, fmt.Errorf("auto TP creation failed and cleanup failed: %v / %v", err, cleanupErr)
-		}
-		return ManualExecution{}, fmt.Errorf("auto TP creation failed; entry cleaned up: %w", err)
+		return ManualExecution{}, b.cleanupFailedAutoExecution(ctx, ownership, fmt.Errorf("auto TP creation failed: %w", err))
 	}
 	placedSL, err := b.broker.ProtectiveStop(ctx, intent.Symbol, oppositeSide, executedText, slText, slID)
 	if err != nil {
-		cleanupErr := b.cleanupOwnedPosition(ctx, binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "sl-cleanup", 0))
-		if cleanupErr != nil {
-			return ManualExecution{}, fmt.Errorf("auto SL creation failed and cleanup failed: %v / %v", err, cleanupErr)
-		}
-		return ManualExecution{}, fmt.Errorf("auto SL creation failed; entry cleaned up: %w", err)
+		return ManualExecution{}, b.cleanupFailedAutoExecution(ctx, ownership, fmt.Errorf("auto SL creation failed: %w", err))
 	}
 
-	_, refreshed, _, err := b.Refresh(ctx)
-	if err != nil || len(refreshed) != 1 {
-		cleanupErr := b.cleanupIfOpen(ctx, binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "verify-cleanup", 0))
-		if cleanupErr != nil {
-			return ManualExecution{}, fmt.Errorf("auto position verification failed and cleanup failed: %v", cleanupErr)
-		}
-		return ManualExecution{}, fmt.Errorf("auto position verification failed; exchange reconciled")
+	_, refreshed, refreshedOrders, err := b.Refresh(ctx)
+	if err != nil || len(refreshed) != 1 || refreshed[0].Side != intent.Side || math.Abs(refreshed[0].QuantityBTC-executed) > 1e-12 {
+		return ManualExecution{}, b.cleanupFailedAutoExecution(ctx, ownership, fmt.Errorf("auto position verification failed"))
+	}
+	protectiveState := autoExecutionState{Symbol: intent.Symbol, EntrySide: intent.Side, EntryFilledQuantity: executed, TPClientAlgoID: tpID, SLClientAlgoID: slID, TPTriggerPrice: tp, SLTriggerPrice: sl, ProtectiveQuantity: executed}
+	if !protectiveOrdersMatchPersisted(refreshedOrders, protectiveState) {
+		return ManualExecution{}, b.cleanupFailedAutoExecution(ctx, ownership, fmt.Errorf("auto protective order verification failed"))
 	}
 	protective := []Order{uiOrder(placedTP, "TP"), uiOrder(placedSL, "SL")}
 	tpValue, slValue := tp, sl
 	refreshed[0].TakeProfit = &tpValue
 	refreshed[0].StopLoss = &slValue
 	return ManualExecution{Order: uiOrder(entry, ""), Position: refreshed[0], Protective: protective, RawOrder: entry}, nil
+}
+
+type autoCleanupOwnership struct {
+	symbol              string
+	side                string
+	requestedQuantity   string
+	entryID             string
+	tpID                string
+	slID                string
+	decisionTimestampMs int64
+	candidateID         string
+	protectiveSide      string
+	protectiveQuantity  string
+	tpTrigger           string
+	slTrigger           string
+}
+
+func unknownAutoExecution(cause error, reason string) error {
+	return fmt.Errorf("%w: %s: %v", errUnknownExecutionState, reason, cause)
+}
+
+// cleanupFailedAutoExecution is the only cleanup path used after an automatic
+// entry may have reached the exchange. It proves ownership from the frozen,
+// deterministic entry ID and the exchange position before sending a reduce-only
+// exit. It never delegates to the manual ClosePosition path.
+func (b *BinanceTestnetBackend) cleanupFailedAutoExecution(ctx context.Context, owned autoCleanupOwnership, cause error) error {
+	timeout := b.autoRecoveryTimeout
+	if timeout <= 0 {
+		timeout = defaultAutoFailureRecoveryTimeout
+	}
+	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+	entry, err := b.broker.GetOrder(recoveryCtx, owned.symbol, owned.entryID)
+	if err != nil {
+		return unknownAutoExecution(cause, "entry lookup failed")
+	}
+	if entry.ClientOrderID != owned.entryID || entry.Symbol != owned.symbol {
+		return unknownAutoExecution(cause, "entry identity mismatch")
+	}
+	expectedEntrySide := "BUY"
+	if owned.side == "SHORT" {
+		expectedEntrySide = "SELL"
+	}
+	if entry.Side != expectedEntrySide {
+		return unknownAutoExecution(cause, "entry side mismatch")
+	}
+	originalQuantity, originalErr := parseNumber("owned entry original quantity", entry.OriginalQuantity)
+	requestedQuantity, requestedErr := parseNumber("requested normalized quantity", owned.requestedQuantity)
+	if originalErr != nil || requestedErr != nil || originalQuantity <= 0 || math.Abs(originalQuantity-requestedQuantity) > 1e-12 {
+		return unknownAutoExecution(cause, "entry original quantity mismatch")
+	}
+	if entry.Status != "FILLED" {
+		switch entry.Status {
+		case "CANCELED", "EXPIRED", "REJECTED":
+			positions, positionErr := b.client.Positions(recoveryCtx, owned.symbol)
+			if positionErr != nil || countOpenPositions(positions) != 0 {
+				return unknownAutoExecution(cause, "non-filled entry position state is uncertain")
+			}
+			if cleanupErr := b.cleanupOwnedProtective(recoveryCtx, owned); cleanupErr != nil {
+				return unknownAutoExecution(cause, "owned protective cleanup failed")
+			}
+			return fmt.Errorf("%w: %v; automatic entry was not filled", errAutoCleanupConfirmed, cause)
+		default:
+			return unknownAutoExecution(cause, "entry fill state is uncertain")
+		}
+	}
+	executed, err := parseNumber("owned entry executed quantity", entry.ExecutedQuantity)
+	if err != nil || executed <= 0 {
+		return unknownAutoExecution(cause, "entry executed quantity is unavailable")
+	}
+	positions, err := b.client.Positions(recoveryCtx, owned.symbol)
+	if err != nil {
+		return unknownAutoExecution(cause, "position lookup failed")
+	}
+	if countOpenPositions(positions) == 0 {
+		if cleanupErr := b.cleanupOwnedProtective(recoveryCtx, owned); cleanupErr != nil {
+			return unknownAutoExecution(cause, "flat-position protective cleanup failed")
+		}
+		positions, err = b.client.Positions(recoveryCtx, owned.symbol)
+		if err != nil || countOpenPositions(positions) != 0 {
+			return unknownAutoExecution(cause, "flat position could not be reconfirmed")
+		}
+		return fmt.Errorf("%w: %v; automatic entry is already flat", errAutoCleanupConfirmed, cause)
+	}
+	position, ok := exactlyOwnedPosition(positions, owned.symbol, owned.side, executed)
+	if !ok {
+		return unknownAutoExecution(cause, "position side or quantity mismatch")
+	}
+	symbol, _, err := b.client.ExchangeSymbol(recoveryCtx, owned.symbol)
+	if err != nil {
+		return unknownAutoExecution(cause, "exchange symbol lookup failed")
+	}
+	quantityText, err := binance.FormatQuantity(symbol, math.Abs(position), true)
+	if err != nil {
+		return unknownAutoExecution(cause, "owned position quantity formatting failed")
+	}
+	exitSide := "SELL"
+	if owned.side == "SHORT" {
+		exitSide = "BUY"
+	}
+	closeID := binance.DeterministicClientOrderID("auto", owned.decisionTimestampMs, owned.candidateID, "failure-cleanup", 0)
+	if _, err = b.broker.ReduceOnlyMarketExit(recoveryCtx, owned.symbol, exitSide, quantityText, closeID); err != nil {
+		return unknownAutoExecution(cause, "reduce-only cleanup result is uncertain")
+	}
+	positions, err = b.client.Positions(recoveryCtx, owned.symbol)
+	if err != nil || countOpenPositions(positions) != 0 {
+		return unknownAutoExecution(cause, "post-cleanup position is not confirmed flat")
+	}
+	if err = b.cleanupOwnedProtective(recoveryCtx, owned); err != nil {
+		return unknownAutoExecution(cause, "owned protective cleanup failed")
+	}
+	return fmt.Errorf("%w: %v; owned automatic entry cleaned up", errAutoCleanupConfirmed, cause)
+}
+
+func (b *BinanceTestnetBackend) cleanupOwnedProtective(ctx context.Context, owned autoCleanupOwnership) error {
+	algos, err := b.client.OpenAlgoOrders(ctx, owned.symbol)
+	if err != nil {
+		return err
+	}
+	type expectation struct{ orderType, trigger string }
+	expected := map[string]expectation{
+		owned.tpID: {orderType: "TAKE_PROFIT_MARKET", trigger: owned.tpTrigger},
+		owned.slID: {orderType: "STOP_MARKET", trigger: owned.slTrigger},
+	}
+	for _, order := range algos {
+		want, ok := expected[order.ClientAlgoID]
+		if !ok {
+			continue
+		}
+		if owned.protectiveSide == "" || owned.protectiveQuantity == "" || want.trigger == "" || order.Symbol != owned.symbol || order.Side != owned.protectiveSide || order.OrderType != want.orderType || order.Quantity != owned.protectiveQuantity || order.TriggerPrice != want.trigger || order.AlgoStatus != "NEW" || !order.ReduceOnly {
+			return fmt.Errorf("owned protective identity mismatch")
+		}
+		if _, err = b.broker.CancelAlgo(ctx, order.ClientAlgoID); err != nil {
+			return err
+		}
+	}
+	remaining, err := b.client.OpenAlgoOrders(ctx, owned.symbol)
+	if err != nil {
+		return err
+	}
+	for _, order := range remaining {
+		if order.ClientAlgoID == owned.tpID || order.ClientAlgoID == owned.slID {
+			return fmt.Errorf("owned protective order cleanup incomplete")
+		}
+	}
+	return nil
+}
+
+func countOpenPositions(positions []binance.PositionV3) int {
+	count := 0
+	for _, position := range positions {
+		quantity, err := strconv.ParseFloat(position.PositionAmount, 64)
+		if err != nil || math.IsNaN(quantity) || math.IsInf(quantity, 0) {
+			return -1
+		}
+		if quantity != 0 {
+			count++
+		}
+	}
+	return count
+}
+
+func exactlyOwnedPosition(positions []binance.PositionV3, symbol, side string, quantity float64) (float64, bool) {
+	var found float64
+	count := 0
+	for _, position := range positions {
+		value, err := strconv.ParseFloat(position.PositionAmount, 64)
+		if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+			return 0, false
+		}
+		if value == 0 {
+			continue
+		}
+		if position.Symbol != symbol {
+			return 0, false
+		}
+		found = value
+		count++
+	}
+	if count != 1 || math.Abs(math.Abs(found)-quantity) > 1e-12 {
+		return 0, false
+	}
+	if side == "LONG" && found <= 0 || side == "SHORT" && found >= 0 {
+		return 0, false
+	}
+	return found, true
 }
 
 // CleanupAutoProtective removes only the protective orders created by the
@@ -587,12 +836,12 @@ func (b *BinanceTestnetBackend) CleanupAutoProtective(ctx context.Context, clien
 	return nil
 }
 
-func (b *BinanceTestnetBackend) cleanupOwnedPosition(ctx context.Context, requestID string) error {
+func (b *BinanceTestnetBackend) cleanupManualOwnedPosition(ctx context.Context, requestID string) error {
 	_, err := b.ClosePosition(ctx, requestID)
 	return err
 }
 
-func (b *BinanceTestnetBackend) cleanupIfOpen(ctx context.Context, requestID string) error {
+func (b *BinanceTestnetBackend) cleanupManualIfOpen(ctx context.Context, requestID string) error {
 	positions, err := b.client.Positions(ctx, "BTCUSDT")
 	if err != nil {
 		return err
@@ -610,7 +859,7 @@ func (b *BinanceTestnetBackend) cleanupIfOpen(ctx context.Context, requestID str
 	if open != 1 {
 		return fmt.Errorf("unexpected position cardinality")
 	}
-	return b.cleanupOwnedPosition(ctx, requestID)
+	return b.cleanupManualOwnedPosition(ctx, requestID)
 }
 
 func (b *BinanceTestnetBackend) ClosePosition(ctx context.Context, requestID string) (binance.Order, error) {

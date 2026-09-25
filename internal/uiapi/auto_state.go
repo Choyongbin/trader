@@ -8,7 +8,9 @@ import (
 	"time"
 )
 
-const autoExecutionStateVersion = 1
+const autoExecutionStateVersion = 2
+
+var autoStateAtomicReplace = replaceAutoExecutionStateAtomic
 
 type autoExecutionState struct {
 	Version                       int                `json:"version"`
@@ -19,10 +21,16 @@ type autoExecutionState struct {
 	EntryClientOrderID            string             `json:"entry_client_order_id"`
 	EntrySide                     string             `json:"entry_side"`
 	EntryRequestedQuantity        float64            `json:"entry_requested_quantity,omitempty"`
+	EntryNormalizedQuantity       string             `json:"entry_normalized_quantity,omitempty"`
 	EntryFilledQuantity           float64            `json:"entry_filled_quantity"`
 	EntryFillPrice                float64            `json:"entry_fill_price"`
+	EntryFillTimestampMs          int64              `json:"entry_fill_timestamp_ms"`
 	TPClientAlgoID                string             `json:"tp_client_algo_id"`
 	SLClientAlgoID                string             `json:"sl_client_algo_id"`
+	TPTriggerPrice                float64            `json:"tp_trigger_price,omitempty"`
+	SLTriggerPrice                float64            `json:"sl_trigger_price,omitempty"`
+	ProtectiveQuantity            float64            `json:"protective_quantity,omitempty"`
+	HorizonSeconds                int                `json:"horizon_seconds,omitempty"`
 	HorizonDeadlineMs             int64              `json:"horizon_deadline_ms"`
 	HorizonCloseRequestID         string             `json:"horizon_close_request_id"`
 	ExecutionState                string             `json:"execution_state"`
@@ -30,13 +38,19 @@ type autoExecutionState struct {
 }
 
 func (s *Server) persistAutoExecutionState(state autoExecutionState) error {
-	if s.autoExecutionStatePath == "" {
-		return nil
-	}
 	state.Version = autoExecutionStateVersion
 	state.Environment = TradingEnvironmentTestnet
 	if state.Symbol == "" {
 		state.Symbol = "BTCUSDT"
+	}
+	if state.ExecutionState != "FLAT" {
+		if err := state.validateForRecovery(); err != nil {
+			return fmt.Errorf("invalid auto execution state: %w", err)
+		}
+	}
+	if s.autoExecutionStatePath == "" {
+		s.autoExecutionState = &state
+		return nil
 	}
 	encoded, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -67,7 +81,7 @@ func (s *Server) persistAutoExecutionState(state autoExecutionState) error {
 		err = closeErr
 	}
 	if err == nil {
-		err = replaceAutoExecutionStateAtomic(tmpName, s.autoExecutionStatePath)
+		err = autoStateAtomicReplace(tmpName, s.autoExecutionStatePath)
 	}
 	if err != nil {
 		return err
@@ -75,6 +89,13 @@ func (s *Server) persistAutoExecutionState(state autoExecutionState) error {
 	ok = true
 	s.autoExecutionState = &state
 	return nil
+}
+
+func (s *Server) persistConfirmedFlatAutoExecutionState() error {
+	return s.persistAutoExecutionState(autoExecutionState{
+		ExecutionState:                "FLAT",
+		LastReconciliationTimestampMs: s.now().UTC().UnixMilli(),
+	})
 }
 
 func (s *Server) loadAutoExecutionState() {
@@ -91,6 +112,14 @@ func (s *Server) loadAutoExecutionState() {
 		s.states[TradingEnvironmentTestnet].AutoState = "UNKNOWN_EXECUTION_STATE"
 		s.logLocked("Auto execution state is corrupt or has incompatible identity; operator intervention required")
 		return
+	}
+	if state.ExecutionState != "FLAT" {
+		if err = state.validateForRecovery(); err != nil {
+			s.autoRecoveryBlocked = true
+			s.states[TradingEnvironmentTestnet].AutoState = "UNKNOWN_EXECUTION_STATE"
+			s.logLocked("Auto execution state is incomplete; operator intervention required")
+			return
+		}
 	}
 	s.autoExecutionState = &state
 	if state.ExecutionState == "FLAT" {
@@ -119,8 +148,11 @@ func (s autoExecutionState) validateForRecovery() error {
 	if s.EntrySide != "LONG" && s.EntrySide != "SHORT" {
 		return fmt.Errorf("invalid entry side")
 	}
-	if s.EntryClientOrderID == "" || s.HorizonCloseRequestID == "" || (s.EntryFilledQuantity <= 0 && s.EntryRequestedQuantity <= 0) {
+	if s.EntryClientOrderID == "" || s.HorizonCloseRequestID == "" || s.EntryNormalizedQuantity == "" || s.HorizonSeconds <= 0 || (s.EntryFilledQuantity <= 0 && s.EntryRequestedQuantity <= 0) {
 		return fmt.Errorf("incomplete entry ownership")
+	}
+	if s.ExecutionState == "POSITION_PROTECTED" && (s.EntryFilledQuantity <= 0 || s.EntryFillTimestampMs <= 0 || s.HorizonDeadlineMs <= 0 || s.TPClientAlgoID == "" || s.SLClientAlgoID == "" || s.TPTriggerPrice <= 0 || s.SLTriggerPrice <= 0 || s.ProtectiveQuantity <= 0) {
+		return fmt.Errorf("incomplete protected position")
 	}
 	return nil
 }

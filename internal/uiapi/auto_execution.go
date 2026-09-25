@@ -2,9 +2,11 @@ package uiapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,12 +61,18 @@ func (s *Server) reconcileAutoOwnedPosition(ctx context.Context) (bool, error) {
 		recovering := s.autoRecoveryBlocked && s.autoExecutionState != nil
 		if s.autoRecoveryBlocked && s.autoExecutionState != nil {
 			persisted := *s.autoExecutionState
+			if persisted.ExecutionState != "POSITION_PROTECTED" {
+				return true, fmt.Errorf("UNKNOWN_EXECUTION_STATE")
+			}
 			expectedQuantity := persisted.EntryFilledQuantity
 			if expectedQuantity <= 0 {
 				expectedQuantity = persisted.EntryRequestedQuantity
 			}
 			if err := persisted.validateForRecovery(); err != nil || len(positions) != 1 || positions[0].Side != persisted.EntrySide || positions[0].QuantityBTC <= 0 || positions[0].QuantityBTC-expectedQuantity > 1e-12 || (persisted.EntryFilledQuantity > 0 && math.Abs(positions[0].QuantityBTC-persisted.EntryFilledQuantity) > 1e-12) {
 				return true, fmt.Errorf("AUTO_RECOVERY_OWNERSHIP_MISMATCH")
+			}
+			if !protectiveOrdersMatchPersisted(orders, persisted) {
+				return true, fmt.Errorf("AUTO_RECOVERY_PROTECTIVE_MISMATCH")
 			}
 		}
 		if !exitDeadline.IsZero() && !s.now().UTC().Before(exitDeadline) {
@@ -92,10 +100,11 @@ func (s *Server) reconcileAutoOwnedPosition(ctx context.Context) (bool, error) {
 			if _, err := closer.CloseAutoPosition(ctx, closeRequestID, ids, expectedSide, expectedQuantity); err != nil {
 				s.mu.Lock()
 				s.states[TradingEnvironmentTestnet].AutoRunning = false
-				s.states[TradingEnvironmentTestnet].AutoState = "ERROR"
-				s.logLocked("Auto horizon exit failed; new entries disabled")
+				s.states[TradingEnvironmentTestnet].AutoState = "UNKNOWN_EXECUTION_STATE"
+				s.autoRecoveryBlocked = true
+				s.logLocked("Auto horizon exit result is unknown; duplicate exit disabled")
 				s.mu.Unlock()
-				return true, fmt.Errorf("AUTO_HORIZON_EXIT_FAILED: %w", err)
+				return true, fmt.Errorf("UNKNOWN_EXECUTION_STATE: horizon exit: %w", err)
 			}
 			s.refreshTestnetForce(ctx)
 			s.mu.Lock()
@@ -107,6 +116,16 @@ func (s *Server) reconcileAutoOwnedPosition(ctx context.Context) (bool, error) {
 				s.mu.Unlock()
 				return true, fmt.Errorf("AUTO_HORIZON_RECONCILIATION_FAILED")
 			}
+			s.mu.Unlock()
+			if err := s.persistConfirmedFlatAutoExecutionState(); err != nil {
+				s.mu.Lock()
+				s.autoRecoveryBlocked = true
+				s.states[TradingEnvironmentTestnet].AutoRunning = false
+				s.states[TradingEnvironmentTestnet].AutoState = "UNKNOWN_EXECUTION_STATE"
+				s.mu.Unlock()
+				return true, fmt.Errorf("AUTO_STATE_PERSIST_FAILED: %w", err)
+			}
+			s.mu.Lock()
 			s.autoOwnedPosition = false
 			s.autoProtectiveIDs = nil
 			s.autoExitDeadline = time.Time{}
@@ -117,9 +136,6 @@ func (s *Server) reconcileAutoOwnedPosition(ctx context.Context) (bool, error) {
 			}
 			s.logLocked("Auto holding horizon exit completed")
 			s.mu.Unlock()
-			if err := s.persistAutoExecutionState(autoExecutionState{ExecutionState: "FLAT", LastReconciliationTimestampMs: s.now().UnixMilli()}); err != nil {
-				return false, fmt.Errorf("AUTO_STATE_PERSIST_FAILED: %w", err)
-			}
 			return false, nil
 		}
 		seen := map[string]bool{}
@@ -174,14 +190,24 @@ func (s *Server) reconcileAutoOwnedPosition(ctx context.Context) (bool, error) {
 	}
 	s.refreshTestnetForce(ctx)
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	state := s.states[TradingEnvironmentTestnet]
 	if !state.ExchangeKnown || len(state.Positions) != 0 || ownedOrdersRemain(state.Orders, ids) {
 		state.AutoRunning = false
 		state.AutoState = "ERROR"
 		s.logLocked("Auto flat-state reconciliation failed; new entries disabled")
+		s.mu.Unlock()
 		return true, fmt.Errorf("AUTO_FLAT_RECONCILIATION_FAILED")
 	}
+	s.mu.Unlock()
+	if err := s.persistConfirmedFlatAutoExecutionState(); err != nil {
+		s.mu.Lock()
+		s.autoRecoveryBlocked = true
+		state.AutoRunning = false
+		state.AutoState = "UNKNOWN_EXECUTION_STATE"
+		s.mu.Unlock()
+		return true, fmt.Errorf("AUTO_STATE_PERSIST_FAILED: %w", err)
+	}
+	s.mu.Lock()
 	s.autoOwnedPosition = false
 	s.autoProtectiveIDs = nil
 	s.autoExitDeadline = time.Time{}
@@ -191,9 +217,7 @@ func (s *Server) reconcileAutoOwnedPosition(ctx context.Context) (bool, error) {
 		state.AutoState = "RUNNING"
 		s.logLocked("Auto position closed and protective orders reconciled")
 	}
-	if err := s.persistAutoExecutionState(autoExecutionState{ExecutionState: "FLAT", LastReconciliationTimestampMs: s.now().UnixMilli()}); err != nil {
-		return false, fmt.Errorf("AUTO_STATE_PERSIST_FAILED: %w", err)
-	}
+	s.mu.Unlock()
 	return false, nil
 }
 
@@ -208,6 +232,32 @@ func ownedOrdersRemain(orders []Order, ids []string) bool {
 		}
 	}
 	return false
+}
+
+func protectiveOrdersMatchPersisted(orders []Order, state autoExecutionState) bool {
+	expectedSide := "SHORT"
+	if state.EntrySide == "SHORT" {
+		expectedSide = "LONG"
+	}
+	want := map[string]struct {
+		kind, orderType string
+		trigger         float64
+	}{
+		state.TPClientAlgoID: {kind: "TP", orderType: "TAKE_PROFIT_MARKET", trigger: state.TPTriggerPrice},
+		state.SLClientAlgoID: {kind: "SL", orderType: "STOP_MARKET", trigger: state.SLTriggerPrice},
+	}
+	seen := map[string]bool{}
+	for _, order := range orders {
+		expected, ok := want[order.ClientOrderID]
+		if !ok {
+			continue
+		}
+		if order.Symbol != state.Symbol || order.Side != expectedSide || order.Protective != expected.kind || order.OrderType != expected.orderType || order.Status != "NEW" || !order.ReduceOnly || math.Abs(order.QuantityBTC-state.ProtectiveQuantity) > 1e-12 || math.Abs(order.Price-expected.trigger) > 1e-9 {
+			return false
+		}
+		seen[order.ClientOrderID] = true
+	}
+	return seen[state.TPClientAlgoID] && seen[state.SLClientAlgoID]
 }
 
 func (s *Server) reconcileAutoLifecycle(ctx context.Context) (bool, error) {
@@ -247,6 +297,21 @@ func (s *Server) executeAutoIntent(ctx context.Context, intent autopipeline.Exec
 	}
 	state.AutoState = "SUBMITTING"
 	s.mu.Unlock()
+	var prepared *autoSubmissionPlan
+	if planner, supported := backend.(preparedAutoTestnetBackend); supported {
+		plan, prepareErr := planner.PrepareAuto(ctx, intent)
+		if prepareErr != nil {
+			s.mu.Lock()
+			state = s.states[TradingEnvironmentTestnet]
+			state.AutoRunning = false
+			state.AutoState = "ERROR"
+			s.apiErrors++
+			s.logLocked("Demo auto entry rejected before exchange submission")
+			s.mu.Unlock()
+			return ManualExecution{}, prepareErr
+		}
+		prepared = &plan
+	}
 	pending := autoExecutionState{
 		CandidateID: intent.CandidateID, DecisionTimestampMs: intent.DecisionTimestampMs,
 		EntryClientOrderID: binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "entry", 0), EntrySide: intent.Side,
@@ -254,7 +319,16 @@ func (s *Server) executeAutoIntent(ctx context.Context, intent autopipeline.Exec
 		TPClientAlgoID:         binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "tp", 0),
 		SLClientAlgoID:         binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "sl", 0),
 		HorizonCloseRequestID:  binance.DeterministicClientOrderID("auto", intent.DecisionTimestampMs, intent.CandidateID, "horizon", 0),
+		HorizonSeconds:         intent.HorizonSeconds,
 		ExecutionState:         "PENDING_ENTRY",
+	}
+	if prepared != nil {
+		pending.EntryClientOrderID = prepared.entryID
+		pending.EntryNormalizedQuantity = prepared.quantityText
+		pending.TPClientAlgoID = prepared.tpID
+		pending.SLClientAlgoID = prepared.slID
+	} else {
+		pending.EntryNormalizedQuantity = strconv.FormatFloat(intent.QuantityBTC, 'f', -1, 64)
 	}
 	if err := s.persistAutoExecutionState(pending); err != nil {
 		s.mu.Lock()
@@ -268,16 +342,47 @@ func (s *Server) executeAutoIntent(ctx context.Context, intent autopipeline.Exec
 	s.actualOrderSubmits++
 	s.mu.Unlock()
 
-	execution, err := backend.SubmitAuto(ctx, intent)
+	var execution ManualExecution
+	var err error
+	if prepared != nil {
+		execution, err = backend.(preparedAutoTestnetBackend).SubmitPreparedAuto(ctx, *prepared)
+	} else {
+		execution, err = backend.SubmitAuto(ctx, intent)
+	}
 	if err != nil {
-		s.refreshTestnetForce(ctx)
+		confirmedFlat := errors.Is(err, errAutoCleanupConfirmed) || errors.Is(err, errAutoEntryNotSubmitted)
+		if confirmedFlat {
+			if persistErr := s.persistConfirmedFlatAutoExecutionState(); persistErr != nil {
+				err = unknownAutoExecution(err, "confirmed flat state persistence failed")
+				confirmedFlat = false
+			}
+		}
 		s.mu.Lock()
 		state = s.states[TradingEnvironmentTestnet]
 		state.AutoRunning = false
-		state.AutoState = "ERROR"
 		s.apiErrors++
-		s.failedUnknownSubmissions++
-		s.autoRecoveryBlocked = true
+		if confirmedFlat {
+			s.autoRecoveryBlocked = false
+			s.autoOwnedPosition = false
+			s.autoProtectiveIDs = nil
+			s.autoExitDeadline = time.Time{}
+			s.autoCloseRequestID = ""
+			if errors.Is(err, errAutoCleanupConfirmed) {
+				state.AutoState = "AUTO_CLEANUP_CONFIRMED"
+				s.logLocked("Demo auto entry failed; exchange cleanup confirmed flat")
+			} else {
+				if s.actualOrderSubmits > 0 {
+					s.actualOrderSubmits--
+				}
+				state.AutoState = "ERROR"
+				s.logLocked("Demo auto entry rejected before exchange submission")
+			}
+		} else {
+			state.AutoState = "UNKNOWN_EXECUTION_STATE"
+			s.failedUnknownSubmissions++
+			s.autoRecoveryBlocked = true
+			s.logLocked("Demo auto execution state is unknown; operator reconciliation required")
+		}
 		s.logLocked("Demo auto execution failed: " + err.Error())
 		s.mu.Unlock()
 		return ManualExecution{}, err
@@ -308,12 +413,16 @@ func (s *Server) executeAutoIntent(ctx context.Context, intent autopipeline.Exec
 	confirmed.EntryClientOrderID = execution.Order.ClientOrderID
 	confirmed.EntryFilledQuantity = execution.Position.QuantityBTC
 	confirmed.EntryFillPrice = execution.Position.EntryPrice
+	confirmed.EntryFillTimestampMs = execution.Order.Time.UnixMilli()
+	confirmed.ProtectiveQuantity = execution.Position.QuantityBTC
 	for _, order := range execution.Protective {
 		switch order.Protective {
 		case "TP":
 			confirmed.TPClientAlgoID = order.ClientOrderID
+			confirmed.TPTriggerPrice = order.Price
 		case "SL":
 			confirmed.SLClientAlgoID = order.ClientOrderID
+			confirmed.SLTriggerPrice = order.Price
 		}
 	}
 	confirmed.HorizonDeadlineMs = execution.Order.Time.Add(time.Duration(intent.HorizonSeconds) * time.Second).UnixMilli()

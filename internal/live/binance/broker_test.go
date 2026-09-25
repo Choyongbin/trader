@@ -19,6 +19,14 @@ type mockTransport struct {
 }
 
 func (m *mockTransport) Signed(_ context.Context, method, path string, values url.Values, out any) error {
+	return m.request(method, path, values, out)
+}
+
+func (m *mockTransport) UserData(_ context.Context, path string, values url.Values, out any) error {
+	return m.request("GET", path, values, out)
+}
+
+func (m *mockTransport) request(method, path string, values url.Values, out any) error {
 	m.calls = append(m.calls, method+" "+path)
 	m.values = append(m.values, values)
 	if path == "/fapi/v1/order" && method == "POST" && m.submitErr != nil {
@@ -51,7 +59,7 @@ func TestAlgoTimeoutWithFailedLookupReturnsUnknownWithoutRetry(t *testing.T) {
 }
 
 func TestAlgoTimeoutAfterAcceptedAdoptsByClientID(t *testing.T) {
-	m := &mockTransport{algoSubmitErr: errors.New("timeout"), algo: AlgoOrder{ClientAlgoID: "safe-sl", AlgoStatus: "NEW"}}
+	m := &mockTransport{algoSubmitErr: errors.New("timeout"), algo: AlgoOrder{ClientAlgoID: "safe-sl", Symbol: "BTCUSDT", Side: "SELL", OrderType: "STOP_MARKET", Quantity: "0.001", TriggerPrice: "100", AlgoStatus: "NEW", ReduceOnly: true}}
 	b := &BinanceTestnetBroker{transport: m}
 	o, err := b.ProtectiveStop(context.Background(), "BTCUSDT", "SELL", "0.001", "100", "safe-sl")
 	if err != nil || o.ClientOrderID != "safe-sl" || len(m.calls) != 2 || m.calls[1] != "GET /fapi/v1/algoOrder" {
@@ -74,7 +82,7 @@ func TestProtectiveOrdersUseCurrentAlgoEndpoint(t *testing.T) {
 }
 
 func TestTimeoutAfterAcceptedAdoptsByClientID(t *testing.T) {
-	m := &mockTransport{submitErr: errors.New("timeout"), order: Order{ClientOrderID: "fixed", Status: "FILLED", ExecutedQuantity: ".001", AveragePrice: "100"}}
+	m := &mockTransport{submitErr: errors.New("timeout"), order: Order{ClientOrderID: "fixed", Symbol: "BTCUSDT", Side: "BUY", Type: "MARKET", OriginalQuantity: ".001", Status: "FILLED", ExecutedQuantity: ".001", AveragePrice: "100"}}
 	b := &BinanceTestnetBroker{transport: m}
 	o, e := b.Submit(context.Background(), Order{Symbol: "BTCUSDT", Side: "BUY", Type: "MARKET", OriginalQuantity: ".001", ClientOrderID: "fixed"})
 	if e != nil || o.LocalState != Filled || len(m.calls) != 2 {

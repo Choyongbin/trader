@@ -36,6 +36,8 @@ type Order struct {
 	ExecutedQuantity string     `json:"executedQty,omitempty"`
 	AveragePrice     string     `json:"avgPrice,omitempty"`
 	ReduceOnly       bool       `json:"reduceOnly"`
+	Time             int64      `json:"time,omitempty"`
+	UpdateTime       int64      `json:"updateTime,omitempty"`
 	LocalState       OrderState `json:"-"`
 }
 
@@ -77,6 +79,7 @@ type Balance struct {
 
 type SignedTransport interface {
 	Signed(context.Context, string, string, url.Values, any) error
+	UserData(context.Context, string, url.Values, any) error
 }
 
 type BinanceTestnetBroker struct {
@@ -115,9 +118,12 @@ func (b *BinanceTestnetBroker) Submit(ctx context.Context, order Order) (Order, 
 	var exchange Order
 	if err := b.transport.Signed(ctx, http.MethodPost, "/fapi/v1/order", v, &exchange); err != nil {
 		adopted, queryErr := b.GetOrder(ctx, order.Symbol, order.ClientOrderID)
-		if queryErr == nil {
+		if queryErr == nil && sameSubmittedOrder(order, adopted) {
 			b.remember(adopted)
 			return adopted, nil
+		}
+		if queryErr == nil {
+			queryErr = fmt.Errorf("queried order identity mismatch")
 		}
 		return order, fmt.Errorf("%w: submit=%v query=%v", ErrSubmitOutcomeUnknown, err, queryErr)
 	}
@@ -159,17 +165,24 @@ func (b *BinanceTestnetBroker) submitAlgo(ctx context.Context, symbol, side, qua
 	var x AlgoOrder
 	if err := b.transport.Signed(ctx, http.MethodPost, "/fapi/v1/algoOrder", v, &x); err != nil {
 		adopted, queryErr := b.GetAlgoOrder(ctx, clientID)
-		if queryErr == nil && adopted.ClientAlgoID == clientID {
+		if queryErr == nil && adopted.ClientAlgoID == clientID && adopted.Symbol == symbol && adopted.Side == side && adopted.OrderType == orderType && adopted.Quantity == quantity && adopted.TriggerPrice == triggerPrice && adopted.ReduceOnly {
 			return adopted, nil
+		}
+		if queryErr == nil {
+			queryErr = fmt.Errorf("queried algo order identity mismatch")
 		}
 		return x, fmt.Errorf("%w: algo submit=%v query=%v", ErrSubmitOutcomeUnknown, err, queryErr)
 	}
 	return x, nil
 }
 
+func sameSubmittedOrder(request, actual Order) bool {
+	return actual.ClientOrderID == request.ClientOrderID && actual.Symbol == request.Symbol && actual.Side == request.Side && actual.Type == request.Type && actual.OriginalQuantity == request.OriginalQuantity && actual.ReduceOnly == request.ReduceOnly
+}
+
 func (b *BinanceTestnetBroker) GetAlgoOrder(ctx context.Context, clientID string) (AlgoOrder, error) {
 	var x AlgoOrder
-	err := b.transport.Signed(ctx, http.MethodGet, "/fapi/v1/algoOrder", url.Values{"clientAlgoId": {clientID}}, &x)
+	err := b.transport.UserData(ctx, "/fapi/v1/algoOrder", url.Values{"clientAlgoId": {clientID}}, &x)
 	return x, err
 }
 
@@ -217,7 +230,7 @@ func stateFromExchange(status string) OrderState {
 
 func (b *BinanceTestnetBroker) GetOrder(ctx context.Context, symbol, clientID string) (Order, error) {
 	var x Order
-	e := b.transport.Signed(ctx, http.MethodGet, "/fapi/v1/order", url.Values{"symbol": {symbol}, "origClientOrderId": {clientID}}, &x)
+	e := b.transport.UserData(ctx, "/fapi/v1/order", url.Values{"symbol": {symbol}, "origClientOrderId": {clientID}}, &x)
 	x.LocalState = stateFromExchange(x.Status)
 	return x, e
 }
@@ -229,7 +242,7 @@ func (b *BinanceTestnetBroker) Cancel(ctx context.Context, symbol, clientID stri
 }
 func (b *BinanceTestnetBroker) OpenOrders(ctx context.Context, symbol string) ([]Order, error) {
 	var x []Order
-	e := b.transport.Signed(ctx, http.MethodGet, "/fapi/v1/openOrders", url.Values{"symbol": {symbol}}, &x)
+	e := b.transport.UserData(ctx, "/fapi/v1/openOrders", url.Values{"symbol": {symbol}}, &x)
 	for i := range x {
 		x[i].LocalState = stateFromExchange(x[i].Status)
 	}
@@ -237,12 +250,12 @@ func (b *BinanceTestnetBroker) OpenOrders(ctx context.Context, symbol string) ([
 }
 func (b *BinanceTestnetBroker) Positions(ctx context.Context, symbol string) ([]Position, error) {
 	var x []Position
-	e := b.transport.Signed(ctx, http.MethodGet, "/fapi/v2/positionRisk", url.Values{"symbol": {symbol}}, &x)
+	e := b.transport.UserData(ctx, "/fapi/v2/positionRisk", url.Values{"symbol": {symbol}}, &x)
 	return x, e
 }
 func (b *BinanceTestnetBroker) Balances(ctx context.Context) ([]Balance, error) {
 	var x []Balance
-	e := b.transport.Signed(ctx, http.MethodGet, "/fapi/v2/balance", nil, &x)
+	e := b.transport.UserData(ctx, "/fapi/v2/balance", nil, &x)
 	return x, e
 }
 func (b *BinanceTestnetBroker) SetLeverage(ctx context.Context, symbol string, leverage int) error {
