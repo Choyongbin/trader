@@ -48,6 +48,9 @@ func (s *Server) entryBlockers(environment TradingEnvironment) []EntryBlocker {
 	if s.autoPipeline == nil || !s.autoFeatureSource {
 		rows = add(rows, "FEATURE_SOURCE_UNAVAILABLE", "Frozen model or live Feature V2 source is unavailable")
 	}
+	if !s.allowModelInTests {
+		rows = add(rows, "FROZEN_MODEL_TIME_ALIGNMENT_UNVERIFIED", "Frozen model uses Metrics fields whose 2024 timestamp semantics and historical availability are not fully verified")
+	}
 	if !market.Connected || now.Sub(market.UpdatedAt) > 10*time.Second {
 		rows = add(rows, "MARKET_DATA_STALE", "Public market data is disconnected or stale")
 	}

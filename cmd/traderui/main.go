@@ -34,6 +34,13 @@ func main() {
 	opsSmoke := flag.Bool("ops-smoke-pass", false, "bounded HTTP/WebSocket smoke passed")
 	opsBuild := flag.Bool("ops-build-pass", false, "full Go test, vet, and build passed")
 	flag.Parse()
+	runtimeMode := strings.ToUpper(strings.TrimSpace(os.Getenv("BINANCE_ENV")))
+	if runtimeMode == "" {
+		runtimeMode = "PUBLIC_ONLY"
+		if err := os.Setenv("BINANCE_ENV", runtimeMode); err != nil {
+			fatal(err)
+		}
+	}
 	if !strings.HasPrefix(*listen, "127.0.0.1:") && !strings.HasPrefix(*listen, "localhost:") {
 		fmt.Fprintln(os.Stderr, "traderui only permits a localhost bind")
 		os.Exit(1)
@@ -68,16 +75,19 @@ func main() {
 		return
 	}
 	var testnet uiapi.TestnetBackend
-	frozenPipeline, err := autopipeline.LoadFrozen(".")
-	if err != nil {
-		fatal(fmt.Errorf("frozen auto pipeline unavailable: %w", err))
+	frozenPipeline, pipelineErr := loadFrozenForConsole(".")
+	if pipelineErr != nil {
+		fmt.Fprintln(os.Stderr, "AUTO_ENTRY_DISABLED:", pipelineErr)
 	}
-	if store, loadErr := provider.Load(); loadErr == nil && store.Testnet.Available() {
-		if backend, backendErr := uiapi.NewBinanceTestnetBackend(store.Testnet.APIKey, store.Testnet.APISecret); backendErr == nil {
-			syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_, _ = backend.SyncTime(syncCtx)
-			cancel()
-			testnet = backend
+	if runtimeMode == "TESTNET" {
+		store, loadErr := provider.Load()
+		if loadErr == nil && store.Testnet.Available() {
+			if backend, backendErr := uiapi.NewBinanceTestnetBackend(store.Testnet.APIKey, store.Testnet.APISecret); backendErr == nil {
+				syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_, _ = backend.SyncTime(syncCtx)
+				cancel()
+				testnet = backend
+			}
 		}
 	}
 	app, err := uiapi.NewServer(provider, static, uiapi.Options{ListenAddress: *listen, WarmupPath: *warmupPath, LiveSnapshotPath: *liveSnapshotPath, AutoExecutionStatePath: *autoStatePath, TestnetBackend: testnet, AutoPipeline: frozenPipeline, LiveFeatureRuntime: true, LiveBootstrap: true, BootstrapStabilization: 5 * time.Minute, PaperOrders: map[uiapi.TradingEnvironment]bool{
@@ -104,10 +114,18 @@ func main() {
 		_ = server.Shutdown(shutdown)
 	}()
 	fmt.Printf("BTCUSDT TRADING CONSOLE V1 http://%s\n", *listen)
-	fmt.Println("EXECUTION=TESTNET MAINNET_ORDERS=DISABLED")
+	fmt.Printf("EXECUTION=%s MAINNET_ORDERS=DISABLED AUTO_ENTRY_MODEL_ALIGNMENT=%s\n", runtimeMode, uiapi.FrozenModelTimeAlignmentStatus)
 	if err = server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		fatal(err)
 	}
+}
+
+func loadFrozenForConsole(root string) (*autopipeline.Pipeline, error) {
+	pipeline, err := autopipeline.LoadFrozen(root)
+	if err != nil {
+		return nil, fmt.Errorf("frozen auto pipeline unavailable; read-only console remains available: %w", err)
+	}
+	return pipeline, nil
 }
 
 func fatal(err error) { fmt.Fprintln(os.Stderr, err); os.Exit(1) }

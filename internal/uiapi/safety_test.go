@@ -38,6 +38,9 @@ func TestOperationalEntryBlockersAndKillSwitch(t *testing.T) {
 	if !contains(read(), "MARKET_DATA_STALE") {
 		t.Fatal("missing stale market blocker")
 	}
+	if !contains(read(), "FROZEN_MODEL_TIME_ALIGNMENT_UNVERIFIED") {
+		t.Fatal("missing frozen model time-alignment blocker")
+	}
 	if response := perform(s.Handler(), http.MethodPost, "/api/auto-trading/emergency-stop?environment=TESTNET", s.csrf, nil); response.Code != http.StatusOK {
 		t.Fatal(response.Body.String())
 	}

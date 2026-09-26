@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $started = [DateTime]::UtcNow
 $stamp = $started.ToString('yyyyMMddTHHmmssZ')
-$reportRoot = Join-Path $projectRoot 'data\reports\verification'
+$reportRoot = Join-Path $projectRoot 'data\reports\project-recovery'
 $runRoot = Join-Path $reportRoot $stamp
 New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
 if (-not (Test-Path -LiteralPath $runRoot -PathType Container)) { throw "verification result directory was not created: $runRoot" }
@@ -244,7 +244,8 @@ try {
                 $lastSystem = $systems[$systems.Count-1]
                 $lastAuto = $autos[$autos.Count-1]
                 $lastMarket = $markets[$markets.Count-1]
-                $apiPass = ($lastSystem.counters.actual_order_submits -eq 0 -and $lastSystem.counters.future_observations -eq 0 -and $lastSystem.frozen.feature_registry_hash -eq 'a37306b80ecbf701103ab691445d07a39624ce995d84f8206d6314dae3045bef' -and -not $lastAuto.running -and -not $lastAuto.readiness.orders_enabled -and -not $lastAuto.readiness.auto_orders_enabled -and $lastMarket.connected)
+                $modelBlocked = @($lastAuto.blockers | Where-Object { $_.code -eq 'FROZEN_MODEL_TIME_ALIGNMENT_UNVERIFIED' }).Count -eq 1
+                $apiPass = ($lastSystem.counters.actual_order_submits -eq 0 -and $lastSystem.counters.future_observations -eq 0 -and $lastSystem.frozen.feature_registry_hash -eq 'a37306b80ecbf701103ab691445d07a39624ce995d84f8206d6314dae3045bef' -and -not $lastAuto.running -and -not $lastAuto.readiness.orders_enabled -and -not $lastAuto.readiness.auto_orders_enabled -and -not $lastAuto.readiness.model_entry_validated -and $modelBlocked -and $lastMarket.connected)
                 $apiEvidence = [ordered]@{ checks=$apiRows.Count; actual_order_submits=$lastSystem.counters.actual_order_submits; future_observations=$lastSystem.counters.future_observations; feature_decisions=$lastSystem.counters.feature_decisions; market_connected=$lastMarket.connected; orders_enabled=$lastAuto.readiness.orders_enabled; auto_orders_enabled=$lastAuto.readiness.auto_orders_enabled }
             }
             if ($apiPass) { Add-Result 'http-api-integration' 'PASS' ("api_checks=" + $apiRows.Count) $apiLog } else { Add-Result 'http-api-integration' 'FAIL' 'API structure, frozen identity, market, or order-disable gate failed' $apiLog }

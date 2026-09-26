@@ -57,12 +57,32 @@ func TestSystemExposesStaleMetricSubsourceBlocker(t *testing.T) {
 	var body struct {
 		MetricsSources map[string]runtimefeature.MetricSourceHealth `json:"metrics_sources"`
 		AutoBlocker    map[string]any                               `json:"auto_blocker"`
+		Frozen         map[string]any                               `json:"frozen"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
 	if body.MetricsSources["metrics_taker"].Status != "STALE" || body.AutoBlocker["source"] != "metrics_taker" || body.AutoBlocker["code"] != "REQUIRED_SOURCE_STALE" {
 		t.Fatalf("metric detail missing: %+v", body)
+	}
+	if body.Frozen["model_time_alignment_status"] != FrozenModelTimeAlignmentStatus {
+		t.Fatalf("model alignment status missing: %+v", body.Frozen)
+	}
+}
+
+func TestDefaultStatusIsPublicOnlyShadow(t *testing.T) {
+	t.Setenv("BINANCE_ENV", "")
+	s := testServer(t)
+	response := perform(s.Handler(), http.MethodGet, "/api/status", "", nil)
+	var body struct {
+		ExecutionDefault string `json:"execution_default"`
+		ExecutionMode    string `json:"execution_mode"`
+	}
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &body) != nil {
+		t.Fatalf("response=%s", response.Body.String())
+	}
+	if body.ExecutionDefault != "PUBLIC_ONLY" || body.ExecutionMode != "PUBLIC_ONLY SHADOW" {
+		t.Fatalf("status=%+v", body)
 	}
 }
 

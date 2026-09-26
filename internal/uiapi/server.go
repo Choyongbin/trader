@@ -26,11 +26,12 @@ import (
 )
 
 const (
-	FeatureRegistryHash = "a37306b80ecbf701103ab691445d07a39624ce995d84f8206d6314dae3045bef"
-	EntryPolicyHash     = "4fae120d9d54a5732dbf2009950beba69773bb0a28a7c3915b616e295cd3dd31"
-	RiskPolicyHash      = "21e3332b5cf286dd39827973a259fbd91dde325ca067f6a067237bb6f24596f7"
-	wsSendQueueSize     = 128
-	wsWriteTimeout      = 5 * time.Second
+	FeatureRegistryHash            = "a37306b80ecbf701103ab691445d07a39624ce995d84f8206d6314dae3045bef"
+	EntryPolicyHash                = "4fae120d9d54a5732dbf2009950beba69773bb0a28a7c3915b616e295cd3dd31"
+	RiskPolicyHash                 = "21e3332b5cf286dd39827973a259fbd91dde325ca067f6a067237bb6f24596f7"
+	FrozenModelTimeAlignmentStatus = "UNVERIFIED"
+	wsSendQueueSize                = 128
+	wsWriteTimeout                 = 5 * time.Second
 )
 
 type wsClient struct {
@@ -105,19 +106,22 @@ type Server struct {
 	// entrySubmitMu is the common side-effect boundary for manual and automatic
 	// entries. STOP takes the same lock, so once STOP returns no entry which had
 	// not crossed this boundary can be submitted.
-	entrySubmitMu            sync.Mutex
-	autoExecutionMu          sync.Mutex
-	autoExecutionHook        func(string) // deterministic test-only scheduling hook
-	autoLifecycleMu          sync.Mutex
-	autoDecisionQueue        chan queuedAutoDecision
-	autoLastDecisionMs       int64
-	autoQueueOverflows       uint64
-	autoStaleDecisions       uint64
-	listenAddress            string
-	autoExecutionStatePath   string
-	liveSnapshotPath         string
-	autoExecutionState       *autoExecutionState
-	autoRecoveryBlocked      bool
+	entrySubmitMu          sync.Mutex
+	autoExecutionMu        sync.Mutex
+	autoExecutionHook      func(string) // deterministic test-only scheduling hook
+	autoLifecycleMu        sync.Mutex
+	autoDecisionQueue      chan queuedAutoDecision
+	autoLastDecisionMs     int64
+	autoQueueOverflows     uint64
+	autoStaleDecisions     uint64
+	listenAddress          string
+	autoExecutionStatePath string
+	liveSnapshotPath       string
+	autoExecutionState     *autoExecutionState
+	autoRecoveryBlocked    bool
+	// Tests that exercise the broker state machine may opt past the research
+	// gate directly. No runtime option or environment variable can enable it.
+	allowModelInTests        bool
 	lastTestnetRefresh       time.Time
 	autoOwnedPosition        bool
 	autoProtectiveIDs        []string
@@ -319,14 +323,19 @@ func (s *Server) getStatus(w http.ResponseWriter, _ *http.Request) {
 	credError := s.credError
 	testAuto, mainAuto := s.states[TradingEnvironmentTestnet].AutoRunning, s.states[TradingEnvironmentMainnet].AutoRunning
 	s.mu.RUnlock()
-	mode := "TESTNET READ ONLY"
-	if s.testnet != nil && s.ordersEnabled(TradingEnvironmentTestnet) {
+	mode := "PUBLIC_ONLY SHADOW"
+	defaultEnvironment := "PUBLIC_ONLY"
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("BINANCE_ENV")), "TESTNET") {
+		mode = "TESTNET READ ONLY"
+		defaultEnvironment = "TESTNET"
+	}
+	if defaultEnvironment == "TESTNET" && s.testnet != nil && s.ordersEnabled(TradingEnvironmentTestnet) {
 		mode = "TESTNET LIVE ORDERS"
 		if _, ok := s.autoBackend(); ok && s.autoOrdersEnabled(TradingEnvironmentTestnet) {
 			mode = "TESTNET LIVE AUTO ORDERS"
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"service": "BTCUSDT TRADING CONSOLE V1", "execution_default": "TESTNET", "execution_mode": mode, "market_data": "BINANCE PUBLIC", "csrf_token": s.csrf, "credentials": presence, "credential_error": credError, "warmup": s.warmup(), "market": market, "auto_trading": map[string]bool{"TESTNET": testAuto, "MAINNET": mainAuto}, "mainnet_orders_default_enabled": false})
+	writeJSON(w, http.StatusOK, map[string]any{"service": "BTCUSDT TRADING CONSOLE V1", "execution_default": defaultEnvironment, "execution_mode": mode, "market_data": "BINANCE PUBLIC", "csrf_token": s.csrf, "credentials": presence, "credential_error": credError, "warmup": s.warmup(), "market": market, "auto_trading": map[string]bool{"TESTNET": testAuto, "MAINNET": mainAuto}, "mainnet_orders_default_enabled": false})
 }
 
 func (s *Server) getEnvironments(w http.ResponseWriter, _ *http.Request) {
@@ -387,7 +396,7 @@ func (s *Server) getMarket(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, value)
 }
 func (s *Server) getModels(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, []ModelProfile{{"btc-feature-v2-production-v1", "BTC Feature V2 Production V1", "V1", FeatureRegistryHash, EntryPolicyHash, RiskPolicyHash, "FROZEN", 5}})
+	writeJSON(w, http.StatusOK, []ModelProfile{{"btc-feature-v2-production-v1", "BTC Feature V2 Production V1", "V1", FeatureRegistryHash, EntryPolicyHash, RiskPolicyHash, "FROZEN_TIME_ALIGNMENT_UNVERIFIED", 5}})
 }
 func (s *Server) getAutoTrading(w http.ResponseWriter, r *http.Request) {
 	environment, ok := environmentFromRequest(w, r)
@@ -440,7 +449,7 @@ func (s *Server) getAutoTrading(w http.ResponseWriter, r *http.Request) {
 	if reason == "" && !autoOrdersEnabled {
 		reason = "AUTO_ORDERS_DISABLED"
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"environment": environment, "running": running, "state": autoState, "signal": signal, "last_result": lastResult, "selected_model": autopipeline.ProfileID, "blockers": blockers, "start_blocked_reason": startBlockedReason, "readiness": map[string]any{"market_public_data": marketConnected, "feature_warmup": warmupReady, "feature_registry": modelReady, "model": modelReady, "entry_policy": modelReady, "risk_policy": modelReady, "account": accountConnected, "broker": brokerReady, "feature_source": featureSource, "position": map[bool]string{true: "OPEN", false: "FLAT"}[positionOpen], "orders_enabled": s.ordersEnabled(environment), "auto_orders_enabled": autoOrdersEnabled, "overall": overall, "blocked_reason": reason}})
+	writeJSON(w, http.StatusOK, map[string]any{"environment": environment, "running": running, "state": autoState, "signal": signal, "last_result": lastResult, "selected_model": autopipeline.ProfileID, "blockers": blockers, "start_blocked_reason": startBlockedReason, "readiness": map[string]any{"market_public_data": marketConnected, "feature_warmup": warmupReady, "feature_registry": modelReady, "model": modelReady, "model_time_alignment_status": FrozenModelTimeAlignmentStatus, "model_entry_validated": s.allowModelInTests, "entry_policy": modelReady, "risk_policy": modelReady, "account": accountConnected, "broker": brokerReady, "feature_source": featureSource, "position": map[bool]string{true: "OPEN", false: "FLAT"}[positionOpen], "orders_enabled": s.ordersEnabled(environment), "auto_orders_enabled": autoOrdersEnabled, "overall": overall, "blocked_reason": reason}})
 }
 
 func (s *Server) startAuto(w http.ResponseWriter, r *http.Request) {
@@ -795,7 +804,7 @@ func (s *Server) getSystem(w http.ResponseWriter, _ *http.Request) {
 	if featureInput {
 		input = "CONNECTED"
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"connections": map[string]any{"futures_ws": !futuresAt.IsZero() && time.Since(futuresAt) <= 10*time.Second, "spot_ws": !spotAt.IsZero() && time.Since(spotAt) <= 10*time.Second, "rest": "READ_ONLY", "account_api": accountStatus}, "sources": sources, "metrics_sources": metricSources, "external_polls": runtimeStats.ExternalPolls, "feature_diagnostics": map[string]any{"last_eligibility_reason": runtimeStats.LastEligibilityReason, "lookback_missing": runtimeStats.LookbackMissing, "metrics_timestamp_spread_ms": runtimeStats.MetricsTimestampSpreadMs, "metrics_timestamp_mismatch": runtimeStats.MetricsTimestampMismatch}, "auto_blocker": autoBlocker, "warmup": warmup, "live_feature_input": input, "feature_engine_state": warmup["status"], "session_started_at": started, "uptime_ms": time.Since(started).Milliseconds(), "latency": latency, "counters": counters, "market_connected": market.Connected, "frozen": map[string]any{"feature_registry_hash": FeatureRegistryHash, "entry_policy_hash": EntryPolicyHash, "risk_policy_hash": RiskPolicyHash, "models": 5}})
+	writeJSON(w, http.StatusOK, map[string]any{"connections": map[string]any{"futures_ws": !futuresAt.IsZero() && time.Since(futuresAt) <= 10*time.Second, "spot_ws": !spotAt.IsZero() && time.Since(spotAt) <= 10*time.Second, "rest": "READ_ONLY", "account_api": accountStatus}, "sources": sources, "metrics_sources": metricSources, "external_polls": runtimeStats.ExternalPolls, "feature_diagnostics": map[string]any{"last_eligibility_reason": runtimeStats.LastEligibilityReason, "lookback_missing": runtimeStats.LookbackMissing, "metrics_timestamp_spread_ms": runtimeStats.MetricsTimestampSpreadMs, "metrics_timestamp_mismatch": runtimeStats.MetricsTimestampMismatch}, "auto_blocker": autoBlocker, "warmup": warmup, "live_feature_input": input, "feature_engine_state": warmup["status"], "session_started_at": started, "uptime_ms": time.Since(started).Milliseconds(), "latency": latency, "counters": counters, "market_connected": market.Connected, "frozen": map[string]any{"feature_registry_hash": FeatureRegistryHash, "entry_policy_hash": EntryPolicyHash, "risk_policy_hash": RiskPolicyHash, "model_time_alignment_status": FrozenModelTimeAlignmentStatus, "models": 5}})
 }
 
 func (s *Server) refreshTestnet(ctx context.Context) {
