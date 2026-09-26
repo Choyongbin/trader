@@ -31,6 +31,12 @@ func externalNumber(raw json.RawMessage) (float64, error) {
 	return v, nil
 }
 
+// KlineObservationComplete is shared with post-run diagnostics so a candle
+// discarded by production cannot later be reported as usable.
+func KlineObservationComplete(x live.ExternalObservation) bool {
+	return x.CloseTimeMs >= x.SourceTimestampMs && x.CloseTimeMs+1 <= x.ReceiveTimestampMs
+}
+
 // parseExternal preserves the livevalidation source fields and receive times.
 // Incomplete kline candles are not published as closed observations.
 func parseExternal(rows []live.ExternalObservation) ([]externalValue, error) {
@@ -50,7 +56,7 @@ func parseExternal(rows []live.ExternalObservation) ([]externalValue, error) {
 			if x.CloseTimeMs < x.SourceTimestampMs {
 				return nil, fmt.Errorf("invalid %s close time", x.Dataset)
 			}
-			if x.CloseTimeMs+1 > x.ReceiveTimestampMs {
+			if !KlineObservationComplete(x) {
 				continue
 			}
 			var tuple []json.RawMessage

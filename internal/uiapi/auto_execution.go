@@ -269,6 +269,8 @@ func (s *Server) reconcileAutoLifecycle(ctx context.Context) (bool, error) {
 func (s *Server) executeAutoIntent(ctx context.Context, intent autopipeline.ExecutionIntent) (ManualExecution, error) {
 	s.autoExecutionMu.Lock()
 	defer s.autoExecutionMu.Unlock()
+	s.entrySubmitMu.Lock()
+	defer s.entrySubmitMu.Unlock()
 	s.mu.Lock()
 	s.autoExecutionAttempts++
 	s.mu.Unlock()
@@ -311,6 +313,9 @@ func (s *Server) executeAutoIntent(ctx context.Context, intent autopipeline.Exec
 			return ManualExecution{}, prepareErr
 		}
 		prepared = &plan
+		if s.autoExecutionHook != nil {
+			s.autoExecutionHook("AFTER_PREPARE")
+		}
 	}
 	pending := autoExecutionState{
 		CandidateID: intent.CandidateID, DecisionTimestampMs: intent.DecisionTimestampMs,
@@ -338,12 +343,31 @@ func (s *Server) executeAutoIntent(ctx context.Context, intent autopipeline.Exec
 		s.mu.Unlock()
 		return ManualExecution{}, fmt.Errorf("AUTO_STATE_PERSIST_FAILED: %w", err)
 	}
+	if s.autoExecutionHook != nil {
+		s.autoExecutionHook("AFTER_PENDING_PERSIST")
+	}
+	var execution ManualExecution
+	var err error
+	if s.autoExecutionHook != nil {
+		s.autoExecutionHook("BEFORE_ENTRY_SUBMIT")
+	}
+	s.mu.RLock()
+	stopped := !s.states[TradingEnvironmentTestnet].AutoRunning || s.states[TradingEnvironmentTestnet].KillSwitch
+	s.mu.RUnlock()
+	if stopped {
+		if err := s.persistConfirmedFlatAutoExecutionState(); err != nil {
+			s.mu.Lock()
+			s.autoRecoveryBlocked = true
+			s.failedUnknownSubmissions++
+			s.states[TradingEnvironmentTestnet].AutoState = "UNKNOWN_EXECUTION_STATE"
+			s.mu.Unlock()
+			return ManualExecution{}, unknownAutoExecution(errAutoEntryNotSubmitted, "STOP abort state persistence failed")
+		}
+		return ManualExecution{}, errAutoEntryNotSubmitted
+	}
 	s.mu.Lock()
 	s.actualOrderSubmits++
 	s.mu.Unlock()
-
-	var execution ManualExecution
-	var err error
 	if prepared != nil {
 		execution, err = backend.(preparedAutoTestnetBackend).SubmitPreparedAuto(ctx, *prepared)
 	} else {

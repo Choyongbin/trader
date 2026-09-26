@@ -13,6 +13,7 @@ import (
 	"binance_trader/internal/external/asof"
 	featurev2 "binance_trader/internal/feature/main/v2"
 	live "binance_trader/internal/live/binance"
+	"binance_trader/internal/live/runtimefeature"
 	"binance_trader/internal/model/logistic"
 )
 
@@ -200,6 +201,9 @@ func selectSourceAudit(rows []live.ExternalObservation, dataset string, decision
 	var best sourceAudit
 	for _, row := range rows {
 		if row.Dataset != dataset {
+			continue
+		}
+		if (dataset == "mark" || dataset == "index" || dataset == "premium") && !runtimefeature.KlineObservationComplete(row) {
 			continue
 		}
 		effective := row.SourceTimestampMs + asof.ExternalSafetyLagMs

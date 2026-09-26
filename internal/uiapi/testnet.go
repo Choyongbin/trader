@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"binance_trader/internal/live/autopipeline"
@@ -253,7 +254,10 @@ func (b *BinanceTestnetBackend) SubmitManual(ctx context.Context, request Manual
 	}
 	nonFlat := false
 	for _, p := range positionsRaw {
-		q, _ := strconv.ParseFloat(p.PositionAmount, 64)
+		q, parseErr := parseNumber("position amount", p.PositionAmount)
+		if parseErr != nil {
+			return ManualExecution{}, fmt.Errorf("exchange position state unavailable: %w", parseErr)
+		}
 		if q != 0 {
 			nonFlat = true
 		}
@@ -289,7 +293,7 @@ func (b *BinanceTestnetBackend) SubmitManual(ctx context.Context, request Manual
 	}
 	entry, err := b.broker.MarketEntry(ctx, request.Symbol, entrySide, quantityText, request.RequestID)
 	if err != nil {
-		cleanupErr := b.cleanupManualIfOpen(ctx, request.RequestID+"-uncertain-cleanup")
+		cleanupErr := b.cleanupManualIfOpen(ctx, request.RequestID, request.RequestID+"-uncertain-cleanup")
 		if cleanupErr != nil {
 			return ManualExecution{}, fmt.Errorf("entry state uncertain and cleanup failed: %v / %v", err, cleanupErr)
 		}
@@ -298,7 +302,7 @@ func (b *BinanceTestnetBackend) SubmitManual(ctx context.Context, request Manual
 	if entry.ExecutedQuantity == "" || entry.AveragePrice == "" || entry.AveragePrice == "0" {
 		queried, queryErr := b.broker.GetOrder(ctx, request.Symbol, request.RequestID)
 		if queryErr != nil {
-			cleanupErr := b.cleanupManualIfOpen(ctx, request.RequestID+"-query-cleanup")
+			cleanupErr := b.cleanupManualIfOpen(ctx, request.RequestID, request.RequestID+"-query-cleanup")
 			if cleanupErr != nil {
 				return ManualExecution{}, fmt.Errorf("entry fill query failed and cleanup failed: %v / %v", queryErr, cleanupErr)
 			}
@@ -308,7 +312,7 @@ func (b *BinanceTestnetBackend) SubmitManual(ctx context.Context, request Manual
 	}
 	executed, err := parseNumber("executed quantity", entry.ExecutedQuantity)
 	if err != nil || executed <= 0 {
-		cleanupErr := b.cleanupManualIfOpen(ctx, request.RequestID+"-fill-cleanup")
+		cleanupErr := b.cleanupManualIfOpen(ctx, request.RequestID, request.RequestID+"-fill-cleanup")
 		if cleanupErr != nil {
 			return ManualExecution{}, fmt.Errorf("entry fill quantity unavailable and cleanup failed: %v", cleanupErr)
 		}
@@ -316,7 +320,7 @@ func (b *BinanceTestnetBackend) SubmitManual(ctx context.Context, request Manual
 	}
 	fill, err := parseNumber("average fill price", entry.AveragePrice)
 	if err != nil || fill <= 0 {
-		cleanupErr := b.cleanupManualIfOpen(ctx, request.RequestID+"-price-cleanup")
+		cleanupErr := b.cleanupManualIfOpen(ctx, request.RequestID, request.RequestID+"-price-cleanup")
 		if cleanupErr != nil {
 			return ManualExecution{}, fmt.Errorf("entry fill price unavailable and cleanup failed: %v", cleanupErr)
 		}
@@ -361,14 +365,14 @@ func (b *BinanceTestnetBackend) SubmitManual(ctx context.Context, request Manual
 		return nil
 	}
 	if err = create(request.TakeProfit, true); err != nil {
-		cleanupErr := b.cleanupManualOwnedPosition(ctx, request.RequestID+"-cleanup")
+		cleanupErr := b.cleanupManualOwnedPosition(ctx, request.RequestID, request.RequestID+"-cleanup")
 		if cleanupErr != nil {
 			return ManualExecution{}, fmt.Errorf("TP creation failed and cleanup failed: %v / %v", err, cleanupErr)
 		}
 		return ManualExecution{}, fmt.Errorf("TP creation failed; entry cleaned up: %w", err)
 	}
 	if err = create(request.StopLoss, false); err != nil {
-		cleanupErr := b.cleanupManualOwnedPosition(ctx, request.RequestID+"-cleanup")
+		cleanupErr := b.cleanupManualOwnedPosition(ctx, request.RequestID, request.RequestID+"-cleanup")
 		if cleanupErr != nil {
 			return ManualExecution{}, fmt.Errorf("SL creation failed and cleanup failed: %v / %v", err, cleanupErr)
 		}
@@ -376,7 +380,7 @@ func (b *BinanceTestnetBackend) SubmitManual(ctx context.Context, request Manual
 	}
 	_, refreshed, _, err := b.Refresh(ctx)
 	if err != nil || len(refreshed) != 1 {
-		cleanupErr := b.cleanupManualIfOpen(ctx, request.RequestID+"-verify-cleanup")
+		cleanupErr := b.cleanupManualIfOpen(ctx, request.RequestID, request.RequestID+"-verify-cleanup")
 		if cleanupErr != nil {
 			return ManualExecution{}, fmt.Errorf("position verification failed and cleanup failed: %v", cleanupErr)
 		}
@@ -836,19 +840,29 @@ func (b *BinanceTestnetBackend) CleanupAutoProtective(ctx context.Context, clien
 	return nil
 }
 
-func (b *BinanceTestnetBackend) cleanupManualOwnedPosition(ctx context.Context, requestID string) error {
-	_, err := b.ClosePosition(ctx, requestID)
+func manualProtectiveIDs(ownerID string) []string {
+	if strings.TrimSpace(ownerID) == "" {
+		return nil
+	}
+	return []string{ownerID + "-tp", ownerID + "-sl"}
+}
+
+func (b *BinanceTestnetBackend) cleanupManualOwnedPosition(ctx context.Context, ownerID, closeRequestID string) error {
+	_, err := b.ClosePositionOwned(ctx, closeRequestID, manualProtectiveIDs(ownerID))
 	return err
 }
 
-func (b *BinanceTestnetBackend) cleanupManualIfOpen(ctx context.Context, requestID string) error {
+func (b *BinanceTestnetBackend) cleanupManualIfOpen(ctx context.Context, ownerID, closeRequestID string) error {
 	positions, err := b.client.Positions(ctx, "BTCUSDT")
 	if err != nil {
 		return err
 	}
 	open := 0
 	for _, p := range positions {
-		q, _ := strconv.ParseFloat(p.PositionAmount, 64)
+		q, parseErr := parseNumber("position amount", p.PositionAmount)
+		if parseErr != nil {
+			return fmt.Errorf("exchange position state unavailable: %w", parseErr)
+		}
 		if q != 0 {
 			open++
 		}
@@ -859,10 +873,17 @@ func (b *BinanceTestnetBackend) cleanupManualIfOpen(ctx context.Context, request
 	if open != 1 {
 		return fmt.Errorf("unexpected position cardinality")
 	}
-	return b.cleanupManualOwnedPosition(ctx, requestID)
+	return b.cleanupManualOwnedPosition(ctx, ownerID, closeRequestID)
 }
 
 func (b *BinanceTestnetBackend) ClosePosition(ctx context.Context, requestID string) (binance.Order, error) {
+	return b.ClosePositionOwned(ctx, requestID, nil)
+}
+
+// ClosePositionOwned closes the net position and removes only protective
+// orders whose client IDs were recorded as owned by this process. An empty
+// ownership set deliberately preserves every open algo order.
+func (b *BinanceTestnetBackend) ClosePositionOwned(ctx context.Context, requestID string, protectiveIDs []string) (binance.Order, error) {
 	_, positions, _, err := b.Refresh(ctx)
 	if err != nil {
 		return binance.Order{}, err
@@ -887,18 +908,15 @@ func (b *BinanceTestnetBackend) ClosePosition(ctx context.Context, requestID str
 	if err != nil {
 		return closed, err
 	}
-	algos, err := b.client.OpenAlgoOrders(ctx, p.Symbol)
-	if err != nil {
-		return closed, err
-	}
-	for _, order := range algos {
-		if _, err = b.broker.CancelAlgo(ctx, order.ClientAlgoID); err != nil {
-			return closed, err
-		}
+	if err = b.CleanupAutoProtective(ctx, protectiveIDs); err != nil {
+		return closed, fmt.Errorf("position closed but owned protective cleanup incomplete: %w", err)
 	}
 	_, finalPositions, finalOrders, err := b.Refresh(ctx)
-	if err != nil || len(finalPositions) != 0 || len(finalOrders) != 0 {
-		return closed, fmt.Errorf("final exchange state is not flat and clean")
+	if err != nil || len(finalPositions) != 0 {
+		return closed, fmt.Errorf("final exchange position is not flat")
+	}
+	if len(protectiveIDs) == 0 && len(finalOrders) != 0 {
+		return closed, fmt.Errorf("position closed; open orders preserved because ownership is unavailable")
 	}
 	return closed, nil
 }

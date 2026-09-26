@@ -157,8 +157,15 @@ try {
     $raceOK = Invoke-Logged 'race-detector' 'go' @('test','-race','./internal/live/binance','./internal/uiapi','-count=1') -AllowFailure
     if (-not $raceOK) {
         $race = $results[$results.Count-1]
-        $race.status = 'SKIP'
-        $race.detail = 'Windows C compiler lacks supported 64-bit race runtime; no installed WSL distribution was detected'
+		$raceLog = if (Test-Path -LiteralPath $race.log) { Get-Content -LiteralPath $race.log -Raw } else { '' }
+		$unsupported = $raceLog -match '(?i)-race is not supported|race detector is not supported|race requires cgo|64-bit mode not compiled in'
+		if ($unsupported) {
+			$race.status = 'SKIP'
+			$race.detail = 'race detector unsupported by the active Go target/toolchain; see log'
+		} else {
+			$race.status = 'FAIL'
+			$race.detail = 'race-enabled build or test failed; failure is not treated as unsupported'
+		}
     }
 
     if ($SkipLive) {

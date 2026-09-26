@@ -84,6 +84,7 @@ type SignedTransport interface {
 
 type BinanceTestnetBroker struct {
 	transport SignedTransport
+	submitMu  sync.Mutex
 	mu        sync.Mutex
 	known     map[string]Order
 }
@@ -101,6 +102,8 @@ func NewBinanceTestnetBroker(client *Client) (*BinanceTestnetBroker, error) {
 var ErrSubmitOutcomeUnknown = errors.New("submit outcome unknown")
 
 func (b *BinanceTestnetBroker) Submit(ctx context.Context, order Order) (Order, error) {
+	b.submitMu.Lock()
+	defer b.submitMu.Unlock()
 	b.mu.Lock()
 	if known, ok := b.known[order.ClientOrderID]; ok {
 		b.mu.Unlock()

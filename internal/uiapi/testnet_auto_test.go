@@ -189,6 +189,35 @@ func (b *autoCleanupFakeBroker) GetOrder(ctx context.Context, _ string, _ string
 	return entry, nil
 }
 
+func TestManualEntryRejectsUnparseablePositionAmount(t *testing.T) {
+	for _, amount := range []string{"not-a-number", "NaN", "+Inf"} {
+		t.Run(amount, func(t *testing.T) {
+			client := &autoCleanupFakeClient{positionAmount: amount}
+			broker := &autoCleanupFakeBroker{client: client}
+			backend := &BinanceTestnetBackend{client: client, broker: broker}
+			_, err := backend.SubmitManual(context.Background(), ManualOrderRequest{Symbol: "BTCUSDT", Side: "LONG", MarginAmountUSDT: 100, Leverage: 1, RequestID: "manual-invalid"})
+			if err == nil || broker.entry.ClientOrderID != "" {
+				t.Fatalf("invalid exchange position was not rejected before entry: err=%v entry=%+v", err, broker.entry)
+			}
+		})
+	}
+}
+
+func TestManualCloseCancelsOnlyOwnedProtectiveOrders(t *testing.T) {
+	client := &autoCleanupFakeClient{positionAmount: "0.001", algos: []binance.AlgoOrder{
+		{Symbol: "BTCUSDT", ClientAlgoID: "owned-tp", Side: "SELL", Quantity: "0.001", TriggerPrice: "101000", AlgoStatus: "NEW", OrderType: "TAKE_PROFIT_MARKET", ReduceOnly: true},
+		{Symbol: "BTCUSDT", ClientAlgoID: "manual-unrelated", Side: "SELL", Quantity: "0.001", TriggerPrice: "90000", AlgoStatus: "NEW", OrderType: "STOP_MARKET", ReduceOnly: true},
+	}}
+	broker := &autoCleanupFakeBroker{client: client}
+	backend := &BinanceTestnetBackend{client: client, broker: broker}
+	if _, err := backend.ClosePositionOwned(context.Background(), "close-owned", []string{"owned-tp"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(broker.canceled) != 1 || broker.canceled[0] != "owned-tp" || len(client.algos) != 1 || client.algos[0].ClientAlgoID != "manual-unrelated" {
+		t.Fatalf("ownership cleanup mismatch canceled=%v remaining=%+v", broker.canceled, client.algos)
+	}
+}
+
 func TestSubmitAutoUsesIndependentBoundedRecoveryContext(t *testing.T) {
 	for _, side := range []string{"LONG", "SHORT"} {
 		t.Run(side+"/request_timeout_recovers", func(t *testing.T) {

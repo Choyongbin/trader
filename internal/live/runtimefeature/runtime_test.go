@@ -163,6 +163,23 @@ func TestRestoreAllowsNoTradeSeconds(t *testing.T) {
 	}
 }
 
+func TestExternalPollFailureAndRecoveryRemainDistinctFromFreshness(t *testing.T) {
+	r := New("", time.Now(), nil)
+	failedAt := time.UnixMilli(1_800_000_000_000)
+	r.RecordExternalPoll("metrics_funding", failedAt, fmt.Errorf("metrics HTTP 503"))
+	s := r.Status(failedAt)
+	h := s.ExternalPolls["metrics_funding"]
+	if h.Result != "FAIL" || h.HTTPStatus != 503 || h.LastAttemptMs != failedAt.UnixMilli() || h.LastSuccessMs != 0 || h.LastError == "" {
+		t.Fatalf("failed poll diagnostics=%+v", h)
+	}
+	recoveredAt := failedAt.Add(time.Second)
+	r.RecordExternalPoll("metrics_funding", recoveredAt, nil)
+	h = r.Status(recoveredAt).ExternalPolls["metrics_funding"]
+	if h.Result != "PASS" || h.LastSuccessMs != recoveredAt.UnixMilli() || h.LastError != "" {
+		t.Fatalf("recovered poll diagnostics=%+v", h)
+	}
+}
+
 func TestRestoreRejectsTradeIDDiscontinuityWithDiagnostics(t *testing.T) {
 	const last int64 = 1_800_200_000_000
 	path := writeRestoreFixture(t, last, 100)

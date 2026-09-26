@@ -81,8 +81,12 @@ func runAudit(provider credentials.Provider, static fs.FS) error {
 		{"stage-g-environment-safety.json", map[string]any{"Version": 1, "Status": "PASS", "Complete": true, "TESTNET_separation": "PASS", "MAINNET_separation": "PASS", "market_data_environment": "BINANCE_PUBLIC", "execution_environment_explicit": true, "Mainnet_warning_UI": true, "Mainnet_backend_flag": "BINANCE_MAINNET_ENABLE_ORDERS=true", "Mainnet_confirmation": "CONFIRM LIVE ORDER", "Mainnet_execution_adapter": "DISABLED", "Testnet_actual_orders": 0, "Mainnet_actual_orders": 0, "secret_exposed": false, "FinalHoldoutAccessed": false}},
 		{"stage-h-ui-integration.json", map[string]any{"Version": 1, "Status": "PASS", "Complete": true, "integration_cases": 15, "environment_data_mixing": 0, "double_submit_orders": 1, "entry_reject_protective_orders": 0, "secret_leak_count": secretLeak, "backend_tests": "PASS", "frontend_validation": "GO_EMBED_COMPILE", "frontend_build": "PENDING", "go_test": "PENDING", "go_vet": "PENDING", "go_build": "PENDING", "actual_orders": 0, "FinalHoldoutAccessed": false}},
 	}
+	for i := 4; i < len(stages); i++ {
+		stages[i].value["Status"] = "NOT_VERIFIED"
+		stages[i].value["evidence"] = "NO_EXECUTED_INTEGRATION_EVIDENCE_IN_THIS_AUDIT"
+	}
 	for _, stage := range stages {
-		if stage.value["Status"] != "PASS" {
+		if stage.value["Status"] == "FAIL" {
 			return fmt.Errorf("%s failed", stage.file)
 		}
 		if err = writeAtomic(filepath.Join(uiReportRoot, stage.file), stage.value, true); err != nil {
@@ -90,10 +94,12 @@ func runAudit(provider credentials.Provider, static fs.FS) error {
 		}
 	}
 	final := map[string]any{"Version": 1, "Status": "READY_FOR_TESTNET_UI", "Complete": true, "phase": "PHASE_UI_1", "credentials": map[string]any{"file_path": provider.Path(), "example_path": "config/binance_credentials.enc.example", "presence": presence, "secret_leak_count": secretLeak, "gitignore": "PASS", "encryption_at_rest": "NOT_IMPLEMENTED_LOCAL_SECRET_CONFIGURATION"}, "UI": map[string]any{"frontend_stack": "STATIC_HTML_CSS_ES_MODULE_GO_EMBED", "pages": []string{"Dashboard", "Trading", "Orders", "System"}, "local_url": "http://127.0.0.1:8080", "WebSocket": true, "frontend_build": "PENDING"}, "account": map[string]any{"balance_UI": true, "positions_UI": true, "current_price_UI": true}, "auto_trading": map[string]any{"model_registry": true, "profiles": 1, "START": true, "STOP_NEW_TRADES": true, "warmup_gate": true}, "manual": map[string]any{"LONG": true, "SHORT": true, "leverage": true, "MarginAmountUSDT_to_PositionNotionalUSDT": true, "TP": true, "SL": true, "extensible_options": true, "double_submit_guard": true}, "environment": map[string]any{"TESTNET_separation": "PASS", "MAINNET_separation": "PASS", "data_mixing_tests": "PASS", "Mainnet_warning_UI": true, "Mainnet_backend_order_guard": "PASS"}, "orders": map[string]any{"page": true, "open_orders": true, "recent_orders": true, "realtime_updates": true}, "system": map[string]any{"connection_health": true, "warmup": true, "latency": true, "logs": true, "frozen_hashes": true}, "safety": map[string]any{"secret_exposed": false, "Mainnet_actual_orders": 0, "Testnet_actual_orders": 0, "FinalHoldoutAccessed": false}, "build": map[string]string{"backend_tests": "PASS", "frontend_tests_typecheck": "NOT_CONFIGURED_NODE_UNAVAILABLE", "frontend_build": "PENDING", "go_test": "PENDING", "go_vet": "PENDING", "go_build": "PENDING"}, "phase_status": map[string]string{"CREDENTIALS": "PASS", "API": "PASS", "FRONTEND": "PASS", "AUTO_TRADING_CONTROL": "PASS", "MANUAL_TRADING": "PASS", "ENVIRONMENT_SAFETY": "PASS", "INTEGRATION": "PASS"}}
+	final["Status"] = "NOT_VERIFIED"
+	final["Complete"] = false
 	if err = writeAtomic(filepath.Join(uiReportRoot, "BTCUSDT-trading-console-v1-final.json"), final, false); err != nil {
 		return err
 	}
-	fmt.Printf("PHASE UI-1 AUDIT PASS stages=%d secret_leaks=%d actual_orders=0\n", len(stages), secretLeak)
+	fmt.Printf("PHASE UI-1 AUDIT NOT_VERIFIED stages=%d secret_leaks=%d actual_orders=0\n", len(stages), secretLeak)
 	return nil
 }
 

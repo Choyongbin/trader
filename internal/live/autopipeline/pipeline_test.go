@@ -44,3 +44,20 @@ func TestFrozenModelBindingAndDryRunRiskIntent(t *testing.T) {
 		t.Fatalf("wrong holding horizon: %d", result.Intent.HorizonSeconds)
 	}
 }
+
+func TestFrozenPolicyBodyTamperingRejected(t *testing.T) {
+	p, err := LoadFrozen(filepath.Join("..", "..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := p.entry
+	entry.Candidates[0].ClassificationThreshold++
+	if err = verifyEntryPolicyHash(entry); err == nil {
+		t.Fatal("entry policy body tampering was accepted")
+	}
+	risk := p.risk
+	risk.RiskPerTrade *= 2
+	if err = verifyRiskPolicyHash(risk); err == nil {
+		t.Fatal("risk policy body tampering was accepted")
+	}
+}

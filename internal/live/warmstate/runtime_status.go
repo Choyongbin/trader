@@ -213,7 +213,8 @@ func RecoverCompletedBootstrap(runtimePath, reportRoot string, now time.Time) (S
 	if err != nil {
 		return s, false, err
 	}
-	if handoff.Status != "PASS" || !handoff.Complete || handoff.UnresolvedGaps != 0 || stabilization.Status != "PASS" || !stabilization.Complete || stabilization.DurationMs < 300_000 || stabilization.FuturesGaps != 0 || stabilization.SpotGaps != 0 || stabilization.FutureObservation != 0 || final.Status != "PASS" || !final.Complete {
+	finalOperational := final.Status == "OPERATIONAL_READY" || final.Status == "PASS" // PASS is retained for existing v1 evidence.
+	if handoff.Status != "PASS" || !handoff.Complete || handoff.UnresolvedGaps != 0 || stabilization.Status != "PASS" || !stabilization.Complete || stabilization.DurationMs < 300_000 || stabilization.FuturesGaps != 0 || stabilization.SpotGaps != 0 || stabilization.FutureObservation != 0 || !finalOperational || !final.Complete {
 		return s, false, nil
 	}
 	completed := stInfo.ModTime().UnixMilli()

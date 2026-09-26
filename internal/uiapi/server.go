@@ -19,6 +19,7 @@ import (
 	"binance_trader/internal/credentials"
 	"binance_trader/internal/external/asof"
 	"binance_trader/internal/live/autopipeline"
+	"binance_trader/internal/live/binance"
 	"binance_trader/internal/live/runtimefeature"
 	"binance_trader/internal/live/warmstate"
 	"github.com/gorilla/websocket"
@@ -101,7 +102,12 @@ type Server struct {
 	featureLatency           latencyRing
 	autoIntents              uint64
 	testnetRefreshMu         sync.Mutex
+	// entrySubmitMu is the common side-effect boundary for manual and automatic
+	// entries. STOP takes the same lock, so once STOP returns no entry which had
+	// not crossed this boundary can be submitted.
+	entrySubmitMu            sync.Mutex
 	autoExecutionMu          sync.Mutex
+	autoExecutionHook        func(string) // deterministic test-only scheduling hook
 	autoLifecycleMu          sync.Mutex
 	autoDecisionQueue        chan queuedAutoDecision
 	autoLastDecisionMs       int64
@@ -449,6 +455,8 @@ func (s *Server) startAuto(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "frozen model profile required")
 		return
 	}
+	s.entrySubmitMu.Lock()
+	defer s.entrySubmitMu.Unlock()
 	if environment == TradingEnvironmentTestnet && s.testnet != nil {
 		s.refreshTestnet(r.Context())
 	}
@@ -494,6 +502,18 @@ func (s *Server) stopAuto(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.states[environment].AutoState = "STOPPING"
 	s.states[environment].AutoRunning = false
+	if r.URL.Path == "/api/auto-trading/emergency-stop" {
+		s.states[environment].KillSwitch = true
+		s.logLocked("Kill switch activated: " + string(environment))
+	}
+	s.logLocked("new entries stopped: " + string(environment))
+	s.mu.Unlock()
+
+	// Wait until any execution which already crossed the common boundary has
+	// either observed STOP and aborted or completed its exchange submission.
+	s.entrySubmitMu.Lock()
+	defer s.entrySubmitMu.Unlock()
+	s.mu.Lock()
 	riskState := "NONE"
 	switch {
 	case environment == TradingEnvironmentTestnet && s.autoRecoveryBlocked:
@@ -505,11 +525,6 @@ func (s *Server) stopAuto(w http.ResponseWriter, r *http.Request) {
 	default:
 		s.states[environment].AutoState = "STOPPED"
 	}
-	if r.URL.Path == "/api/auto-trading/emergency-stop" {
-		s.states[environment].KillSwitch = true
-		s.logLocked("Kill switch activated: " + string(environment))
-	}
-	s.logLocked("new entries stopped: " + string(environment))
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"environment": environment, "running": false, "existing_risk_management": "PRESERVED", "existing_risk_state": riskState, "kill_switch_active": r.URL.Path == "/api/auto-trading/emergency-stop"})
 }
@@ -538,7 +553,10 @@ func (s *Server) manualOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "explicit Mainnet confirmation required")
 		return
 	}
-	if request.Environment == TradingEnvironmentTestnet && s.testnet != nil && !s.paperOrders[request.Environment] {
+	actualTestnet := request.Environment == TradingEnvironmentTestnet && s.testnet != nil && !s.paperOrders[request.Environment]
+	if actualTestnet {
+		s.entrySubmitMu.Lock()
+		defer s.entrySubmitMu.Unlock()
 		s.refreshTestnet(r.Context())
 	}
 	s.mu.Lock()
@@ -559,7 +577,7 @@ func (s *Server) manualOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Unlock()
-	if request.Environment == TradingEnvironmentTestnet && !s.paperOrders[request.Environment] {
+	if actualTestnet {
 		s.mu.Lock()
 		s.actualOrderSubmits++
 		s.mu.Unlock()
@@ -647,6 +665,8 @@ func (s *Server) closePosition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if environment == TradingEnvironmentTestnet && s.testnet != nil && !s.paperOrders[environment] {
+		s.entrySubmitMu.Lock()
+		defer s.entrySubmitMu.Unlock()
 		if !s.ordersEnabled(environment) {
 			writeError(w, http.StatusConflict, "order safety gate rejected close")
 			return
@@ -658,7 +678,24 @@ func (s *Server) closePosition(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.actualOrderSubmits++
 		s.mu.Unlock()
-		order, err := s.testnet.ClosePosition(r.Context(), requestID)
+		s.mu.RLock()
+		ownedProtective := append([]string(nil), s.autoProtectiveIDs...)
+		if !s.autoOwnedPosition {
+			ownedProtective = make([]string, 0, 2*len(s.states[environment].Processed))
+			for ownerID := range s.states[environment].Processed {
+				ownedProtective = append(ownedProtective, ownerID+"-tp", ownerID+"-sl")
+			}
+		}
+		s.mu.RUnlock()
+		var order binance.Order
+		var err error
+		if owned, ok := s.testnet.(interface {
+			ClosePositionOwned(context.Context, string, []string) (binance.Order, error)
+		}); ok {
+			order, err = owned.ClosePositionOwned(r.Context(), requestID, ownedProtective)
+		} else {
+			order, err = s.testnet.ClosePosition(r.Context(), requestID)
+		}
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
@@ -758,7 +795,7 @@ func (s *Server) getSystem(w http.ResponseWriter, _ *http.Request) {
 	if featureInput {
 		input = "CONNECTED"
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"connections": map[string]any{"futures_ws": !futuresAt.IsZero() && time.Since(futuresAt) <= 10*time.Second, "spot_ws": !spotAt.IsZero() && time.Since(spotAt) <= 10*time.Second, "rest": "READ_ONLY", "account_api": accountStatus}, "sources": sources, "metrics_sources": metricSources, "auto_blocker": autoBlocker, "warmup": warmup, "live_feature_input": input, "feature_engine_state": warmup["status"], "session_started_at": started, "uptime_ms": time.Since(started).Milliseconds(), "latency": latency, "counters": counters, "market_connected": market.Connected, "frozen": map[string]any{"feature_registry_hash": FeatureRegistryHash, "entry_policy_hash": EntryPolicyHash, "risk_policy_hash": RiskPolicyHash, "models": 5}})
+	writeJSON(w, http.StatusOK, map[string]any{"connections": map[string]any{"futures_ws": !futuresAt.IsZero() && time.Since(futuresAt) <= 10*time.Second, "spot_ws": !spotAt.IsZero() && time.Since(spotAt) <= 10*time.Second, "rest": "READ_ONLY", "account_api": accountStatus}, "sources": sources, "metrics_sources": metricSources, "external_polls": runtimeStats.ExternalPolls, "feature_diagnostics": map[string]any{"last_eligibility_reason": runtimeStats.LastEligibilityReason, "lookback_missing": runtimeStats.LookbackMissing, "metrics_timestamp_spread_ms": runtimeStats.MetricsTimestampSpreadMs, "metrics_timestamp_mismatch": runtimeStats.MetricsTimestampMismatch}, "auto_blocker": autoBlocker, "warmup": warmup, "live_feature_input": input, "feature_engine_state": warmup["status"], "session_started_at": started, "uptime_ms": time.Since(started).Milliseconds(), "latency": latency, "counters": counters, "market_connected": market.Connected, "frozen": map[string]any{"feature_registry_hash": FeatureRegistryHash, "entry_policy_hash": EntryPolicyHash, "risk_policy_hash": RiskPolicyHash, "models": 5}})
 }
 
 func (s *Server) refreshTestnet(ctx context.Context) {

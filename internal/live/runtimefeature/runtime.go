@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"binance_trader/internal/external/asof"
@@ -30,6 +32,11 @@ type Stats struct {
 	LastDecisionMs                                                                              int64
 	SourceLastMs                                                                                map[string]int64
 	MetricSources                                                                               map[string]MetricSourceHealth
+	ExternalPolls                                                                               map[string]ExternalPollHealth
+	LastEligibilityReason                                                                       featurev2.Reason
+	LookbackMissing                                                                             []string
+	MetricsTimestampSpreadMs                                                                    int64
+	MetricsTimestampMismatch                                                                    bool
 	Status                                                                                      warmstate.Status
 	BootstrapSeeded                                                                             bool
 	BootstrapFetchCompletedMs                                                                   int64
@@ -39,6 +46,14 @@ type Stats struct {
 	RestoreExpectedFuturesID, RestoreActualFuturesID                                            int64
 	RestoreExpectedSpotID, RestoreActualSpotID                                                  int64
 	RestoreSnapshotLastEventMs, RestoreActualFuturesMs, RestoreActualSpotMs                     int64
+}
+
+type ExternalPollHealth struct {
+	LastAttemptMs int64  `json:"last_attempt_ms"`
+	LastSuccessMs int64  `json:"last_success_ms"`
+	Result        string `json:"result"`
+	HTTPStatus    int    `json:"http_status"`
+	LastError     string `json:"last_error,omitempty"`
 }
 
 type MetricSourceHealth struct {
@@ -531,7 +546,13 @@ func (r *Runtime) drain() {
 		r.v2.Prune(decision)
 		r.stats.FeatureDecisions++
 		r.stats.LastDecisionMs = decision
+		r.stats.LastEligibilityReason = reason
 		r.lastReason = reason
+		if reason == featurev2.LookbackUnavailable {
+			r.stats.LookbackMissing = r.v2.LookbackMissing(decision, r.historyStart)
+		} else {
+			r.stats.LookbackMissing = nil
+		}
 		if reason == featurev2.FutureObservation {
 			r.stats.FutureObservations++
 		}
@@ -583,6 +604,33 @@ func (r *Runtime) AddExternal(rows []live.ExternalObservation) error {
 		return fmt.Errorf("external observation queue overflow")
 	}
 	return nil
+}
+
+// RecordExternalPoll keeps transport health separate from source freshness.
+// Failed attempts never advance the last successful observation timestamp.
+func (r *Runtime) RecordExternalPoll(source string, attemptedAt time.Time, pollErr error) {
+	if r.stats.ExternalPolls == nil {
+		r.stats.ExternalPolls = map[string]ExternalPollHealth{}
+	}
+	h := r.stats.ExternalPolls[source]
+	h.LastAttemptMs = attemptedAt.UnixMilli()
+	h.HTTPStatus = 0
+	if pollErr == nil {
+		h.Result = "PASS"
+		h.LastSuccessMs = h.LastAttemptMs
+		h.LastError = ""
+	} else {
+		h.Result = "FAIL"
+		h.LastError = pollErr.Error()
+		parts := strings.Fields(pollErr.Error())
+		for i := 0; i+1 < len(parts); i++ {
+			if parts[i] == "HTTP" {
+				h.HTTPStatus, _ = strconv.Atoi(strings.Trim(parts[i+1], ":;,."))
+				break
+			}
+		}
+	}
+	r.stats.ExternalPolls[source] = h
 }
 
 func pruneBars(rows []market.SecondBar, cutoff int64) []market.SecondBar {
@@ -667,6 +715,11 @@ func (r *Runtime) Status(now time.Time) Stats {
 		s.SourceLastMs[key] = value
 	}
 	s.MetricSources = make(map[string]MetricSourceHealth, len(r.metricSources))
+	s.ExternalPolls = make(map[string]ExternalPollHealth, len(r.stats.ExternalPolls))
+	for key, value := range r.stats.ExternalPolls {
+		s.ExternalPolls[key] = value
+	}
+	var metricMin, metricMax int64
 	for key, value := range r.metricSources {
 		value.FreshnessLimitMs = asof.MetricsMaxFreshAgeMs
 		value.CurrentAgeMs = now.UnixMilli() - value.LastSourceTimestampMs
@@ -677,6 +730,18 @@ func (r *Runtime) Status(now time.Time) Stats {
 			value.Status = "STALE"
 		}
 		s.MetricSources[key] = value
+		if strings.HasPrefix(key, "metrics_") && value.LastSourceTimestampMs > 0 {
+			if metricMin == 0 || value.LastSourceTimestampMs < metricMin {
+				metricMin = value.LastSourceTimestampMs
+			}
+			if value.LastSourceTimestampMs > metricMax {
+				metricMax = value.LastSourceTimestampMs
+			}
+		}
+	}
+	if metricMin > 0 {
+		s.MetricsTimestampSpreadMs = metricMax - metricMin
+		s.MetricsTimestampMismatch = metricMax != metricMin
 	}
 	available := int64(0)
 	if r.lastBar >= r.historyStart && r.historyStart > 0 {

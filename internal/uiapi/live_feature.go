@@ -3,6 +3,7 @@ package uiapi
 import (
 	"context"
 	"sort"
+	"sync"
 	"time"
 
 	featurev2 "binance_trader/internal/feature/main/v2"
@@ -13,10 +14,13 @@ import (
 )
 
 type liveFeatureEvent struct {
-	trade     *live.CaptureEvent
-	external  []live.ExternalObservation
-	source    string
-	connected bool
+	trade      *live.CaptureEvent
+	external   []live.ExternalObservation
+	pollSource string
+	pollAt     time.Time
+	pollErr    error
+	source     string
+	connected  bool
 }
 
 func (s *Server) runLiveFeature(ctx context.Context, events <-chan liveFeatureEvent) {
@@ -57,6 +61,9 @@ func (s *Server) runLiveFeature(ctx context.Context, events <-chan liveFeatureEv
 	const maxBufferedEvents = 250_000
 	buffered := make([]liveFeatureEvent, 0, 8192)
 	process := func(event liveFeatureEvent) error {
+		if event.pollSource != "" {
+			engine.RecordExternalPoll(event.pollSource, event.pollAt, event.pollErr)
+		}
 		if event.source != "" {
 			engine.Connection(event.source, event.connected)
 		}
@@ -134,14 +141,27 @@ func (s *Server) runLiveFeature(ctx context.Context, events <-chan liveFeatureEv
 			engine.EnableLiveEmission()
 		}
 		if bootstrapState == "READY" && stats.Status.Ready && !finalWritten {
-			finalWritten = true
 			s.mu.RLock()
 			actualOrders := s.actualOrderSubmits
 			s.mu.RUnlock()
-			_ = bootstrap.WriteCheckpoint("", "stage-h-parity.json", map[string]any{"status": "PASS", "complete": true, "feature_count": 128, "feature_mismatch": 0, "eligibility_mismatch": 0, "future_observation": stats.FutureObservations, "method": "BOOTSTRAP_SEED_TO_LIVE_COMMON_DECISIONS"})
-			_ = bootstrap.WriteCheckpoint("", "stage-i-stabilization.json", map[string]any{"status": "PASS", "complete": true, "duration_ms": stats.Status.StabilizationMs, "futures_bars": stats.FuturesBars, "spot_bars": stats.SpotBars, "futures_gaps": stats.FuturesGaps, "spot_gaps": stats.SpotGaps, "future_observation": stats.FutureObservations})
-			_ = bootstrap.WriteCheckpoint("", "stage-j-ui.json", map[string]any{"status": "PASS", "complete": true, "dashboard_bootstrap": "PASS", "system_bootstrap": "PASS", "auto_gate": "PASS", "actual_order_submits": actualOrders})
-			_, _ = bootstrap.WriteFinal("", map[string]any{"status": "PASS", "complete": true, "source_bootstrap": "PASS", "canonical": "PASS", "feature_seed": "PASS", "live_handoff": "PASS", "parity": "PASS", "stabilization": "PASS", "ui": "PASS", "live_startup": "FAST_BOOTSTRAP_READY", "four_hour_wait_required": false, "feature_count": 128, "futures_trade_rows": len(bootstrapResult.FuturesTrades), "spot_trade_rows": len(bootstrapResult.SpotTrades), "futures_bars": stats.FuturesBars, "spot_bars": stats.SpotBars, "external_observations": len(bootstrapResult.External), "feature_mismatch": 0, "eligibility_mismatch": 0, "future_observation": stats.FutureObservations, "historical_receive_time_fabricated": false, "historical_signals": 0, "historical_execution_intents": 0, "historical_orders": 0, "demo_actual_orders": actualOrders, "mainnet_private_calls": 0, "mainnet_orders": 0, "secret_leak": 0, "signature_leak": 0})
+			reportErr := bootstrap.WriteCheckpoint("", "stage-h-parity.json", map[string]any{"status": "NOT_VERIFIED", "complete": true, "feature_count": 128, "future_observation": stats.FutureObservations, "reason": "NO_SIDE_BY_SIDE_PARITY_EXECUTION_EVIDENCE"})
+			if reportErr == nil {
+				reportErr = bootstrap.WriteCheckpoint("", "stage-i-stabilization.json", map[string]any{"status": "PASS", "complete": true, "duration_ms": stats.Status.StabilizationMs, "futures_bars": stats.FuturesBars, "spot_bars": stats.SpotBars, "futures_gaps": stats.FuturesGaps, "spot_gaps": stats.SpotGaps, "future_observation": stats.FutureObservations})
+			}
+			if reportErr == nil {
+				reportErr = bootstrap.WriteCheckpoint("", "stage-j-ui.json", map[string]any{"status": "NOT_VERIFIED", "complete": true, "dashboard_bootstrap": "NOT_VERIFIED", "system_bootstrap": "NOT_VERIFIED", "auto_gate": "NOT_VERIFIED", "actual_order_submits": actualOrders})
+			}
+			if reportErr == nil {
+				_, reportErr = bootstrap.WriteFinal("", map[string]any{"status": "OPERATIONAL_READY", "complete": true, "source_bootstrap": "PASS", "canonical": "PASS", "feature_seed": "PASS", "live_handoff": "PASS", "parity": "NOT_VERIFIED", "stabilization": "PASS", "ui": "NOT_VERIFIED", "live_startup": "FAST_BOOTSTRAP_READY", "four_hour_wait_required": false, "feature_count": 128, "futures_trade_rows": len(bootstrapResult.FuturesTrades), "spot_trade_rows": len(bootstrapResult.SpotTrades), "futures_bars": stats.FuturesBars, "spot_bars": stats.SpotBars, "external_observations": len(bootstrapResult.External), "future_observation": stats.FutureObservations, "historical_receive_time_fabricated": false, "historical_signals": 0, "historical_execution_intents": 0, "historical_orders": 0, "demo_actual_orders": actualOrders, "mainnet_private_calls": 0, "mainnet_orders": 0, "secret_leak": 0, "signature_leak": 0})
+			}
+			if reportErr != nil {
+				s.mu.Lock()
+				s.apiErrors++
+				s.logLocked("Live verification report write failed")
+				s.mu.Unlock()
+			} else {
+				finalWritten = true
+			}
 		}
 		if persistErr != nil {
 			s.mu.Lock()
@@ -319,31 +339,51 @@ func requiredMetricBlockerSource(stats runtimefeature.Stats) string {
 }
 
 func (s *Server) pollLiveExternal(ctx context.Context, events chan<- liveFeatureEvent) {
-	fetch := func() {
-		pollCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
-		rows, err := live.FetchPublicObservations(pollCtx)
-		cancel()
-		if err != nil {
-			s.mu.Lock()
-			s.apiErrors++
-			s.logLocked("Live external public source unavailable")
-			s.mu.Unlock()
+	type fetcher func(context.Context) ([]live.ExternalObservation, error)
+	poll := func(source string, interval, timeout time.Duration, fetch fetcher) {
+		run := func() bool {
+			attemptedAt := time.Now().UTC()
+			pollCtx, cancel := context.WithTimeout(ctx, timeout)
+			rows, err := fetch(pollCtx)
+			cancel()
+			if err != nil {
+				s.mu.Lock()
+				s.apiErrors++
+				s.logLocked("Live " + source + " public source unavailable")
+				s.mu.Unlock()
+			}
+			select {
+			case events <- liveFeatureEvent{external: rows, pollSource: source, pollAt: attemptedAt, pollErr: err}:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		if !run() {
 			return
 		}
-		select {
-		case events <- liveFeatureEvent{external: rows}:
-		case <-ctx.Done():
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !run() {
+					return
+				}
+			}
 		}
 	}
-	fetch()
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			fetch()
-		}
-	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		poll("kline", 10*time.Second, 15*time.Second, live.FetchPublicKlineObservations)
+	}()
+	go func() {
+		defer wg.Done()
+		poll("metrics_funding", 30*time.Second, 25*time.Second, live.FetchPublicSlowObservations)
+	}()
+	wg.Wait()
 }

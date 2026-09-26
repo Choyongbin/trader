@@ -257,6 +257,12 @@ func run(preflightOnly bool, scope string) error {
 	}
 	if allComplete {
 		m := aggregate(checkpoints, months)
+		if err := validateExpected(m, scope); err != nil {
+			return err
+		}
+		if err := ensureNoTempArtifacts(filepath.FromSlash("data/features/main/v2/BTCUSDT")); err != nil {
+			return err
+		}
 		if err := publishFinal(m, len(months), 0, "PASS", time.Since(start), scope); err != nil {
 			return err
 		}
@@ -356,7 +362,9 @@ func run(preflightOnly bool, scope string) error {
 				return err
 			}
 			if skip {
-				consumeV1(v1, decision)
+				if err = consumeV1(v1, decision); err != nil {
+					return fmt.Errorf("consume reused V1 month %s: %w", month, err)
+				}
 				engine.Prune(decision)
 				continue
 			}
@@ -425,11 +433,11 @@ func run(preflightOnly bool, scope string) error {
 	if err = validateExpected(m, scope); err != nil {
 		return err
 	}
-	if err = publishFinal(m, reused, rebuilt, "PASS", time.Since(start), scope); err != nil {
+	if err = ensureNoTempArtifacts(filepath.FromSlash("data/features/main/v2/BTCUSDT")); err != nil {
 		return err
 	}
-	if tmp, _ := filepath.Glob(filepath.FromSlash("data/features/main/v2/BTCUSDT/*/*.tmp")); len(tmp) != 0 {
-		return fmt.Errorf("tmp artifacts=%d", len(tmp))
+	if err = publishFinal(m, reused, rebuilt, "PASS", time.Since(start), scope); err != nil {
+		return err
 	}
 	fmt.Printf("MATERIALIZATION PASS eligible=%d total=%d rebuilt=%d\n", m.Eligible, m.TotalCandidates, rebuilt)
 	return nil
@@ -578,7 +586,21 @@ func takeV1(c *cursor[mainfeature.MainFeaturesV1], decision int64) (mainfeature.
 	r := c.current
 	return r, true, c.consume()
 }
-func consumeV1(c *cursor[mainfeature.MainFeaturesV1], decision int64) { _, _, _ = takeV1(c, decision) }
+func consumeV1(c *cursor[mainfeature.MainFeaturesV1], decision int64) error {
+	_, _, err := takeV1(c, decision)
+	return err
+}
+
+func ensureNoTempArtifacts(root string) error {
+	tmp, err := filepath.Glob(filepath.Join(root, "*", "*.tmp"))
+	if err != nil {
+		return fmt.Errorf("scan tmp artifacts: %w", err)
+	}
+	if len(tmp) != 0 {
+		return fmt.Errorf("tmp artifacts=%d", len(tmp))
+	}
+	return nil
+}
 
 func newCheckpoint(month, path string) monthCheckpoint {
 	stats := make([]featureStats, featurev2.ModelFeatureCountV2)

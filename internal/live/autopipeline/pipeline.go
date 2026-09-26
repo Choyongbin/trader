@@ -30,33 +30,75 @@ type Candidate struct {
 	TPBps                   int     `json:"tp_bps"`
 	SLBps                   int     `json:"sl_bps"`
 	HorizonSeconds          int     `json:"horizon_seconds"`
+	SelectedModelType       string  `json:"selected_model_type"`
 	ModelArtifactPath       string  `json:"model_artifact_path"`
 	ClassificationModelSHA  string  `json:"classification_model_sha256"`
+	RegressionModelSHA      string  `json:"regression_model_sha256"`
+	PreprocessingSHA        string  `json:"preprocessing_sha256"`
+	FeatureRegistryHash     string  `json:"feature_registry_hash"`
+	ThresholdPercentile     float64 `json:"threshold_percentile"`
 	ClassificationThreshold float64 `json:"classification_numeric_threshold"`
 	RegressionThreshold     float64 `json:"regression_numeric_threshold"`
+	ValidationScoreRows     int64   `json:"validation_score_rows"`
+}
+type confirmationCriteria struct {
+	MeanReturnPositive     bool  `json:"mean_realized_net_return_ex_funding_positive"`
+	MinimumPositiveMonths  int   `json:"minimum_positive_months_of_six"`
+	Thinning15mPositive    bool  `json:"thinning_15m_mean_positive"`
+	Thinning60mPositive    bool  `json:"thinning_60m_mean_positive_or_warning_if_too_small"`
+	MinimumSignalsOverall  int64 `json:"minimum_evaluable_signals_overall"`
+	MinimumSignalsPerMonth int64 `json:"minimum_evaluable_signals_per_month"`
+	FutureObservationZero  bool  `json:"future_observation_zero"`
+}
+type eventRules struct {
+	PositionMode      string `json:"position_mode"`
+	OpenSignalPolicy  string `json:"open_signal_policy"`
+	WhileOpenPolicy   string `json:"while_open_policy"`
+	ClosePolicy       string `json:"close_policy"`
+	NotionalBasis     string `json:"notional_basis"`
+	FeeSlippagePolicy string `json:"fee_slippage_policy"`
+	FundingPolicy     string `json:"funding_policy"`
 }
 type frozenEntry struct {
-	FeatureRegistryHash string      `json:"feature_registry_hash"`
-	PolicyHash          string      `json:"policy_sha256"`
-	Frozen              bool        `json:"POLICY_FROZEN"`
-	Complete            bool        `json:"complete"`
-	Candidates          []Candidate `json:"candidates"`
+	Version                  int                  `json:"version"`
+	Stage                    string               `json:"stage"`
+	Status                   string               `json:"status"`
+	StageCPath               string               `json:"stage_c_path"`
+	StageCSHA256             string               `json:"stage_c_sha256"`
+	FeatureCount             int                  `json:"feature_count"`
+	FeatureRegistryHash      string               `json:"feature_registry_hash"`
+	Candidates               []Candidate          `json:"candidates"`
+	EntryRule                string               `json:"entry_rule"`
+	ConflictRule             string               `json:"candidate_conflict_rule"`
+	TieRule                  string               `json:"tie_rule"`
+	NoTradeRule              string               `json:"no_trade_rule"`
+	ThinningRule             string               `json:"thinning_rule"`
+	ConfirmationCriteria     confirmationCriteria `json:"test_confirmation_criteria"`
+	EventRules               eventRules           `json:"event_backtest_rules"`
+	ProbabilityCalibration   string               `json:"probability_calibration"`
+	FrozenAt                 string               `json:"frozen_at"`
+	TestAccessedBeforeFreeze bool                 `json:"test_accessed_before_freeze"`
+	Frozen                   bool                 `json:"POLICY_FROZEN"`
+	PolicyHash               string               `json:"policy_sha256"`
+	FinalHoldoutAccessed     bool                 `json:"final_holdout_accessed"`
+	Complete                 bool                 `json:"complete"`
 }
 type riskCandidate struct {
-	CandidateID            string
-	TargetNotionalFraction float64
-	Leverage               int
-	MarginFraction         float64
-	Valid                  bool
+	CandidateID                                                                  string
+	SLBps                                                                        int
+	EffectiveStopLossFraction, RawTargetNotionalFraction, TargetNotionalFraction float64
+	Leverage                                                                     int
+	MarginFraction, ConservativeMoveToMarginExhaustion, RequiredGuard            float64
+	Valid                                                                        bool
 }
 type frozenRisk struct {
-	RiskPolicySHA       string `json:"risk_policy_sha256"`
-	StartingEquity      float64
-	RiskPerTrade        float64
-	MaxNotionalFraction float64
-	MaxMarginFraction   float64
-	MaxLeverage         int
-	Candidates          []riskCandidate
+	Version                                                                                            int `json:"risk_policy_version"`
+	StartingEquity, RiskPerTrade, MaxNotionalFraction, MaxMarginFraction                               float64
+	MaxLeverage                                                                                        int
+	MarginMode, LeverageSelection, LiquidationGuard, CostAssumptionIdentity, FundingAccountingIdentity string
+	SinglePosition                                                                                     bool
+	Candidates                                                                                         []riskCandidate
+	RiskPolicySHA                                                                                      string `json:"risk_policy_sha256"`
 }
 type model struct {
 	FeatureCount        int             `json:"feature_count"`
@@ -138,12 +180,18 @@ func LoadFrozen(root string) (*Pipeline, error) {
 	if !entry.Complete || !entry.Frozen || entry.FeatureRegistryHash != FeatureHash || entry.PolicyHash != EntryHash || len(entry.Candidates) != 5 {
 		return nil, fmt.Errorf("ENTRY_POLICY_IDENTITY_MISMATCH")
 	}
+	if err := verifyEntryPolicyHash(entry); err != nil {
+		return nil, err
+	}
 	var risk frozenRisk
 	if err := read(filepath.FromSlash("data/reports/production/v1/BTCUSDT/risk-policy-v1.json"), &risk); err != nil {
 		return nil, err
 	}
 	if risk.RiskPolicySHA != RiskHash || len(risk.Candidates) != 5 || risk.RiskPerTrade <= 0 {
 		return nil, fmt.Errorf("RISK_POLICY_IDENTITY_MISMATCH")
+	}
+	if err := verifyRiskPolicyHash(risk); err != nil {
+		return nil, err
 	}
 	p := &Pipeline{entry: entry, risk: risk, models: make([]model, len(entry.Candidates)), riskByID: map[string]riskCandidate{}}
 	for _, x := range risk.Candidates {
@@ -174,6 +222,34 @@ func LoadFrozen(root string) (*Pipeline, error) {
 		}
 	}
 	return p, nil
+}
+
+func verifyEntryPolicyHash(entry frozenEntry) error {
+	stored := entry.PolicyHash
+	entry.PolicyHash = ""
+	identity, err := json.Marshal(entry)
+	if err != nil {
+		return fmt.Errorf("ENTRY_POLICY_HASH_RECALCULATION_FAILED: %w", err)
+	}
+	sum := sha256.Sum256(identity)
+	if hex.EncodeToString(sum[:]) != stored {
+		return fmt.Errorf("ENTRY_POLICY_BODY_HASH_MISMATCH")
+	}
+	return nil
+}
+
+func verifyRiskPolicyHash(risk frozenRisk) error {
+	stored := risk.RiskPolicySHA
+	risk.RiskPolicySHA = ""
+	identity, err := json.Marshal(risk)
+	if err != nil {
+		return fmt.Errorf("RISK_POLICY_HASH_RECALCULATION_FAILED: %w", err)
+	}
+	sum := sha256.Sum256(identity)
+	if hex.EncodeToString(sum[:]) != stored {
+		return fmt.Errorf("RISK_POLICY_BODY_HASH_MISMATCH")
+	}
+	return nil
 }
 
 func (p *Pipeline) Evaluate(features featurev2.Snapshot, equity, entryPrice float64) (Result, error) {

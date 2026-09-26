@@ -230,6 +230,47 @@ func (e *StreamingEngine) Compute(decision, historyStart int64, v1row mainfeatur
 	return s, Eligible, nil
 }
 
+// LookbackMissing reports the exact prerequisites behind LOOKBACK_UNAVAILABLE.
+// It is diagnostic-only and uses the same selectors and boundaries as Compute.
+func (e *StreamingEngine) LookbackMissing(decision, historyStart int64) []string {
+	missing := make([]string, 0, 12)
+	if decision-historyStart < RequiredWarmupMs {
+		missing = append(missing, "WARMUP_4H")
+	}
+	current, currentOK := e.spot[decision-1000]
+	if !currentOK {
+		missing = append(missing, "SPOT_CURRENT")
+	}
+	for _, seconds := range []int64{5, 30, 60, 300} {
+		base, ok := e.spot[decision-(seconds+1)*1000]
+		if !currentOK || !ok || current.sequence-base.sequence != seconds {
+			missing = append(missing, fmt.Sprintf("SPOT_%dS", seconds))
+		}
+	}
+	checks := []struct {
+		name string
+		ok   bool
+	}{
+		{"METRICS_5M", endpointReady(selectMetrics(e.metrics, decision-300000))},
+		{"METRICS_15M", endpointReady(selectMetrics(e.metrics, decision-900000))},
+		{"METRICS_60M", endpointReady(selectMetrics(e.metrics, decision-3600000))},
+		{"MARK_5M", endpointReady(selectKline(e.mark, decision-300000))},
+		{"INDEX_5M", endpointReady(selectKline(e.index, decision-300000))},
+		{"PREMIUM_5M", endpointReady(selectKline(e.premium, decision-300000))},
+		{"PREMIUM_15M", endpointReady(selectKline(e.premium, decision-900000))},
+	}
+	for _, check := range checks {
+		if !check.ok {
+			missing = append(missing, check.name)
+		}
+	}
+	_, prior := selectFunding(e.funding, decision)
+	if prior == nil {
+		missing = append(missing, "FUNDING_PRIOR")
+	}
+	return missing
+}
+
 func spotState(rows map[int64]spotAggregate, decision int64) SourceState {
 	_, ok := rows[decision-1000]
 	return SourceState{Available: ok, Fresh: ok, EffectiveAvailableAtMs: decision}

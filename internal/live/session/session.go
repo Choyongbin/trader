@@ -54,8 +54,10 @@ type Result struct {
 }
 
 type externalResult struct {
-	rows []live.ExternalObservation
-	err  error
+	source      string
+	attemptedAt time.Time
+	rows        []live.ExternalObservation
+	err         error
 }
 
 func Run(ctx context.Context, options Options) (Result, error) {
@@ -204,6 +206,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 				options.OnStatus(engine.Status(time.Now()))
 			}
 		case external := <-externals:
+			engine.RecordExternalPoll(external.source, external.attemptedAt, external.err)
 			if external.err == nil {
 				if err = engine.AddExternal(external.rows); err != nil {
 					finalize()
@@ -322,14 +325,15 @@ func pollExternal(ctx context.Context, out chan<- externalResult) {
 // pollExternalWithFetch separates cadences without changing the receive pipeline.
 func pollExternalWithFetch(ctx context.Context, out chan<- externalResult, fast, slow func(context.Context) ([]live.ExternalObservation, error), fastInterval, slowInterval time.Duration) {
 	var wg sync.WaitGroup
-	poll := func(interval, timeout time.Duration, fetcher func(context.Context) ([]live.ExternalObservation, error)) {
+	poll := func(source string, interval, timeout time.Duration, fetcher func(context.Context) ([]live.ExternalObservation, error)) {
 		defer wg.Done()
 		fetch := func() bool {
+			attemptedAt := time.Now().UTC()
 			pollCtx, cancel := context.WithTimeout(ctx, timeout)
 			rows, err := fetcher(pollCtx)
 			cancel()
 			select {
-			case out <- externalResult{rows: rows, err: err}:
+			case out <- externalResult{source: source, attemptedAt: attemptedAt, rows: rows, err: err}:
 				return true
 			case <-ctx.Done():
 				return false
@@ -355,8 +359,8 @@ func pollExternalWithFetch(ctx context.Context, out chan<- externalResult, fast,
 	// Run the one-minute kline and five-minute metrics pollers independently.
 	// A slow metrics request cannot delay the 10-second kline cadence.
 	wg.Add(2)
-	go poll(fastInterval, 15*time.Second, fast)
-	go poll(slowInterval, 25*time.Second, slow)
+	go poll("kline", fastInterval, 15*time.Second, fast)
+	go poll("metrics_funding", slowInterval, 25*time.Second, slow)
 	<-ctx.Done()
 	wg.Wait()
 }
