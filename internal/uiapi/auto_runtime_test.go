@@ -87,6 +87,7 @@ func TestAutoStateMachineReadyFixtureAndStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.allowModelInTests = true
 	now := time.Now().UTC()
 	s.SetMarket(Market{FuturesPrice: 100000, SpotPrice: 99999, MarkPrice: 100001, UpdatedAt: now, Connected: true})
 	s.mu.Lock()
@@ -112,6 +113,45 @@ func TestAutoStateMachineReadyFixtureAndStop(t *testing.T) {
 	restarted, err := NewServer(fakeProvider{credentials.CredentialStore{}}, static, Options{WarmupPath: path, AutoPipeline: pipeline, AutoFeatureSource: true})
 	if err != nil || restarted.states[TradingEnvironmentTestnet].AutoState != "STOPPED" {
 		t.Fatal("restart auto-resumed")
+	}
+}
+
+func TestFrozenModelTimeAlignmentBlocksOtherwiseReadyAutoStart(t *testing.T) {
+	t.Setenv("BINANCE_ENV", "TESTNET")
+	t.Setenv("BINANCE_TESTNET_ENABLE_ORDERS", "true")
+	t.Setenv("BINANCE_TESTNET_ENABLE_AUTO_ORDERS", "true")
+	path := filepath.Join(t.TempDir(), "capture-state.json")
+	checkpoint := map[string]any{"RequiredWarmupMs": 14_400_000, "AvailableContiguousHistoryMs": 14_400_000, "WarmupReady": true, "LastUpdatedMs": time.Now().UnixMilli()}
+	body, _ := json.Marshal(checkpoint)
+	if err := os.WriteFile(path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	pipeline, err := autopipeline.LoadFrozen(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &fakeTestnetBackend{}
+	static := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("console")}}
+	s, err := NewServer(fakeProvider{credentials.CredentialStore{Testnet: credentials.EnvironmentCredentials{APIKey: "key", APISecret: "secret"}}}, static, Options{WarmupPath: path, TestnetBackend: backend, AutoPipeline: pipeline, AutoFeatureSource: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	s.SetMarket(Market{FuturesPrice: 100000, SpotPrice: 99999, MarkPrice: 100001, UpdatedAt: now, Connected: true})
+	s.mu.Lock()
+	for _, kind := range []string{"futures", "spot", "mark"} {
+		s.marketSourceUpdated[kind] = now
+	}
+	s.mu.Unlock()
+	response := perform(s.Handler(), http.MethodPost, "/api/auto-trading/start?environment=TESTNET", s.csrf, map[string]string{"model_profile_id": autopipeline.ProfileID})
+	if response.Code != http.StatusConflict || s.states[TradingEnvironmentTestnet].AutoRunning || backend.autoSubmitCalls != 0 {
+		t.Fatalf("status=%d running=%t submits=%d body=%s", response.Code, s.states[TradingEnvironmentTestnet].AutoRunning, backend.autoSubmitCalls, response.Body.String())
+	}
+	var result struct {
+		BlockedReason string `json:"blocked_reason"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || result.BlockedReason != "FROZEN_MODEL_TIME_ALIGNMENT_UNVERIFIED" {
+		t.Fatalf("result=%+v err=%v body=%s", result, err, response.Body.String())
 	}
 }
 
